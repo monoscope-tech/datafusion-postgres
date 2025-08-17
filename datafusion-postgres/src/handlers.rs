@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::auth::{AuthManager, Permission, ResourceType};
@@ -66,8 +67,8 @@ impl PgWireServerHandlers for HandlerFactory {
 }
 
 /// Per-connection transaction state storage
-/// We use the process ID as the connection identifier since it's unique per connection
-pub type ConnectionId = i32;
+/// We use a hash of both PID and secret key as the connection identifier for better uniqueness
+pub type ConnectionId = u64;
 
 #[derive(Debug, Clone)]
 struct ConnectionState {
@@ -137,8 +138,18 @@ impl DfSessionService {
     }
 
     fn get_client_id<C: ClientInfo>(client: &C) -> ConnectionId {
-        // Use the process ID which is unique per connection
-        client.pid_and_secret_key().0
+        // Use a hash of PID, secret key, and socket address for better uniqueness
+        let (pid, secret) = client.pid_and_secret_key();
+        let socket_addr = client.socket_addr();
+        
+        // Create a hash of all identifying values
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pid.hash(&mut hasher);
+        secret.hash(&mut hasher);
+        socket_addr.hash(&mut hasher);
+        
+        let conn_id = hasher.finish();
+        conn_id
     }
 
     /// Check if the current user has permission to execute a query
