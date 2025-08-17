@@ -141,15 +141,14 @@ impl DfSessionService {
         // Use a hash of PID, secret key, and socket address for better uniqueness
         let (pid, secret) = client.pid_and_secret_key();
         let socket_addr = client.socket_addr();
-        
+
         // Create a hash of all identifying values
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         pid.hash(&mut hasher);
         secret.hash(&mut hasher);
         socket_addr.hash(&mut hasher);
-        
-        let conn_id = hasher.finish();
-        conn_id
+
+        hasher.finish()
     }
 
     /// Check if the current user has permission to execute a query
