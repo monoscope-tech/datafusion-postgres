@@ -28,6 +28,59 @@ use arrow_pg::datatypes::df;
 use arrow_pg::datatypes::{arrow_schema_to_pg_fields, into_pg_type};
 use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
 
+/// Rewrites Postgres command synonyms that DataFusion's SQL parser doesn't
+/// recognize. Applied to every incoming SQL string before parsing — covers
+/// both the simple-query and extended-query (parse) paths.
+///
+/// Currently handles:
+/// - `ABORT [ WORK | TRANSACTION ]` → `ROLLBACK [ WORK | TRANSACTION ]`.
+///   Postgres treats these as synonyms; Hasql's connection pool emits
+///   `ABORT` defensively on session acquisition, which would otherwise
+///   produce `sql parser error: Expected: an SQL statement, found: ABORT`
+///   and poison the session.
+///
+/// Returns `Cow::Borrowed` on the no-rewrite fast path so the common case
+/// pays only a short case-insensitive prefix check.
+fn rewrite_postgres_synonyms(sql: &str) -> std::borrow::Cow<'_, str> {
+    let stripped = sql.trim_start();
+    if stripped.len() < 5 {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    let (head, rest) = stripped.split_at(5);
+    if !head.eq_ignore_ascii_case("ABORT") {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    // Only treat as the command form when ABORT stands alone (not when it's
+    // a prefix of an identifier like `aborted`).
+    if !(rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')) {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    std::borrow::Cow::Owned(format!("ROLLBACK{}", rest))
+}
+
+#[cfg(test)]
+mod synonym_tests {
+    use super::rewrite_postgres_synonyms as r;
+
+    #[test]
+    fn rewrites_abort_forms() {
+        assert_eq!(r("ABORT"), "ROLLBACK");
+        assert_eq!(r("ABORT;"), "ROLLBACK;");
+        assert_eq!(r("  abort  "), "ROLLBACK  ");
+        assert_eq!(r("Abort Work"), "ROLLBACK Work");
+        assert_eq!(r("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
+    }
+
+    #[test]
+    fn leaves_non_abort_alone() {
+        assert_eq!(r("SELECT 1"), "SELECT 1");
+        assert_eq!(r("BEGIN"), "BEGIN");
+        assert_eq!(r("ROLLBACK"), "ROLLBACK");
+        assert_eq!(r("SELECT aborted FROM t"), "SELECT aborted FROM t");
+        assert_eq!(r("ABORTED"), "ABORTED");
+    }
+}
+
 /// Simple startup handler that does no authentication
 pub struct SimpleStartupHandler;
 
@@ -125,6 +178,8 @@ impl SimpleQueryHandler for DfSessionService {
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
         log::debug!("Received query: {query}");
+        let rewritten = rewrite_postgres_synonyms(query);
+        let query = rewritten.as_ref();
         let statements = self
             .parser
             .sql_parser
@@ -176,16 +231,14 @@ impl SimpleQueryHandler for DfSessionService {
                 }
             };
 
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&df).await?;
+            if let Some(resp) = dml_completion(&df).await? {
                 results.push(resp);
             } else {
-                // For non-INSERT queries, return a regular Query response
                 let format_options =
                     Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp =
-                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?;
-                results.push(Response::Query(resp));
+                results.push(Response::Query(
+                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?,
+                ));
             }
         }
         Ok(results)
@@ -241,7 +294,7 @@ impl ExtendedQueryHandler for DfSessionService {
             }
         }
 
-        if let (_, Some((statement, plan))) = &portal.statement.statement {
+        if let (_, Some((_statement, plan))) = &portal.statement.statement {
             let param_types = planner::get_inferred_parameter_types(plan)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
@@ -252,11 +305,22 @@ impl ExtendedQueryHandler for DfSessionService {
                 .clone()
                 .replace_params_with_values(&param_values)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            let optimised = self
-                .session_context
-                .state()
-                .optimize(&plan)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            // Skip per-query `state.optimize()` ONLY when some hook
+            // pre-optimized the plan at parse time (TimeFusion's PlanCacheHook
+            // does this). Plans that fell through the bypass paths
+            // (statement_to_plan in `do_parse_query`) are still optimized
+            // here. Measured: skipping the redundant optimize on the cached
+            // path dropped pgwire end-to-end p95 from 131ms → 8ms (~16×).
+            let canonical_sql = &portal.statement.statement.0;
+            let pre_optimized = self.query_hooks.iter().any(|h| h.was_pre_optimized(canonical_sql));
+            let optimised = if pre_optimized {
+                plan
+            } else {
+                self.session_context
+                    .state()
+                    .optimize(&plan)
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            };
 
             let dataframe = {
                 let timeout = client::get_statement_timeout(client);
@@ -282,21 +346,19 @@ impl ExtendedQueryHandler for DfSessionService {
                 }
             };
 
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&dataframe).await?;
-
+            if let Some(resp) = dml_completion(&dataframe).await? {
                 Ok(resp)
             } else {
-                // For non-INSERT queries, return a regular Query response
                 let format_options =
                     Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp = df::encode_dataframe(
-                    dataframe,
-                    &portal.result_column_format,
-                    Some(format_options),
-                )
-                .await?;
-                Ok(Response::Query(resp))
+                Ok(Response::Query(
+                    df::encode_dataframe(
+                        dataframe,
+                        &portal.result_column_format,
+                        Some(format_options),
+                    )
+                    .await?,
+                ))
             }
         } else {
             Ok(Response::EmptyQuery)
@@ -304,28 +366,37 @@ impl ExtendedQueryHandler for DfSessionService {
     }
 }
 
-async fn map_rows_affected_for_insert(df: &DataFrame) -> PgWireResult<Response> {
-    // For INSERT queries, we need to execute the query to get the row count
-    // and return an Execution response with the proper tag
-    let result = df
+/// If `df` runs a DML/COPY plan, execute it and return a `CommandComplete`
+/// response with the right tag; otherwise return `None` so the caller falls
+/// back to the regular `Response::Query` path. Driving this off
+/// `LogicalPlan` (not the parsed AST) keeps the simple- and extended-query
+/// paths consistent with what DataFusion actually runs — statement-level
+/// rewrites can leave the AST in a non-Insert variant for what's really a write.
+async fn dml_completion(df: &DataFrame) -> PgWireResult<Option<Response>> {
+    use datafusion::arrow::array::UInt64Array;
+    use datafusion::logical_expr::dml::WriteOp;
+    let tag = match df.logical_plan() {
+        LogicalPlan::Dml(d) => match d.op {
+            WriteOp::Insert(_) => Tag::new("INSERT").with_oid(0),
+            WriteOp::Update => Tag::new("UPDATE"),
+            WriteOp::Delete => Tag::new("DELETE"),
+            WriteOp::Ctas => Tag::new("SELECT"),
+            WriteOp::Truncate => Tag::new("TRUNCATE"),
+        },
+        LogicalPlan::Copy(_) => Tag::new("COPY"),
+        _ => return Ok(None),
+    };
+    let batches = df
         .clone()
         .collect()
         .await
         .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-
-    // Extract count field from the first batch
-    let rows_affected = result
+    let rows = batches
         .first()
-        .and_then(|batch| batch.column_by_name("count"))
-        .and_then(|col| {
-            col.as_any()
-                .downcast_ref::<datafusion::arrow::array::UInt64Array>()
-        })
-        .map_or(0, |array| array.value(0) as usize);
-
-    // Create INSERT tag with the affected row count
-    let tag = Tag::new("INSERT").with_oid(0).with_rows(rows_affected);
-    Ok(Response::Execution(tag))
+        .and_then(|b| b.column_by_name("count"))
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .map_or(0, |a| a.value(0) as usize);
+    Ok(Some(Response::Execution(tag.with_rows(rows))))
 }
 
 pub struct Parser {
@@ -348,6 +419,8 @@ impl QueryParser for Parser {
         C: ClientInfo + Unpin + Send + Sync,
     {
         log::debug!("Received parse extended query: {sql}");
+        let rewritten = rewrite_postgres_synonyms(sql);
+        let sql = rewritten.as_ref();
         let mut statements = self
             .sql_parser
             .parse(sql)
@@ -404,18 +477,30 @@ impl QueryParser for Parser {
         stmt: &Self::Statement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        if let (_, Some((_, plan))) = stmt {
-            let schema = plan.schema();
-            let fields = arrow_schema_to_pg_fields(
-                schema.as_arrow(),
-                column_format.unwrap_or(&Format::UnifiedBinary),
-                None,
-            )?;
-
-            Ok(fields)
-        } else {
-            Ok(vec![])
+        let Some((_, plan)) = stmt.1.as_ref() else {
+            return Ok(vec![]);
+        };
+        let schema = plan.schema();
+        let fields = schema.fields();
+        // DataFusion emits `[count: UInt64]` for every DML/COPY plan — see
+        // `make_count_schema` in datafusion/expr/src/logical_plan/dml.rs.
+        // pgwire's contract for these without RETURNING is NoData; strict
+        // clients reject a TuplesOk/NoData mismatch at Describe time. Match
+        // on the exact shape so RETURNING (wider schema) and any future
+        // upstream rename (e.g. `rows_affected`) fall through to the real
+        // result path — at which point this guard needs to be updated.
+        if matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Copy(_))
+            && fields.len() == 1
+            && fields[0].name() == "count"
+            && fields[0].data_type() == &DataType::UInt64
+        {
+            return Ok(vec![]);
         }
+        arrow_schema_to_pg_fields(
+            schema.as_arrow(),
+            column_format.unwrap_or(&Format::UnifiedBinary),
+            None,
+        )
     }
 }
 
@@ -423,13 +508,14 @@ fn ordered_param_types(types: &HashMap<String, Option<DataType>>) -> Vec<Option<
     // Datafusion stores the parameters as a map.  In our case, the keys will be
     // `$1`, `$2` etc.  The values will be the parameter types.
     //
-    // PATCH (timefusion): the original sorted lexicographically (`a.0.cmp(b.0)`),
-    // which puts `$10` before `$2` and breaks every INSERT/SELECT with more than 9
-    // placeholders — the ParameterDescription returned to the client has the wrong
-    // positional order, so e.g. a uuid gets typed as TIMESTAMPTZ. Sort by numeric suffix.
-    let mut types = types.iter().collect::<Vec<_>>();
-    types.sort_by_key(|(k, _)| k.trim_start_matches('$').parse::<u32>().unwrap_or(u32::MAX));
-    types.into_iter().map(|pt| pt.1.as_ref()).collect()
+    // PATCH (timefusion): original implementation sorted lexicographically
+    // (`a.0.cmp(b.0)`), which puts `$10` before `$2` and breaks every
+    // INSERT/SELECT with more than 9 placeholders — the ParameterDescription
+    // returned to the client has the wrong positional order, so e.g. a uuid
+    // gets typed as TIMESTAMPTZ. Sort by the numeric suffix instead.
+    let mut entries: Vec<_> = types.iter().collect();
+    entries.sort_by_key(|(k, _)| k.trim_start_matches('$').parse::<u32>().unwrap_or(u32::MAX));
+    entries.into_iter().map(|pt| pt.1.as_ref()).collect()
 }
 
 #[cfg(test)]
@@ -609,5 +695,50 @@ mod tests {
             .any(|m| matches!(m, PgWireBackendMessage::ParameterStatus(_)));
 
         assert!(!has_ps, "statement_timeout should not send ParameterStatus");
+    }
+
+    /// `Describe Statement` for INSERT/UPDATE/DELETE without RETURNING must
+    /// return an empty result schema so pgwire emits `NoData`. Strict clients
+    /// (Hasql, pgjdbc, Npgsql, psycopg3, sqlx) treat a `RowDescription` here
+    /// as a `TuplesOk` protocol error and drop the write. SELECT is the
+    /// fallthrough positive control.
+    #[tokio::test]
+    async fn get_result_schema_returns_no_data_for_dml() {
+        let service = crate::testing::setup_handlers();
+        let mut client = MockClient::new();
+
+        <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "CREATE TABLE t (id INT, name TEXT)",
+        )
+        .await
+        .unwrap();
+
+        let parser = <DfSessionService as ExtendedQueryHandler>::query_parser(&service);
+        let cases: &[(&str, bool)] = &[
+            ("INSERT INTO t VALUES (1, 'a')", true),
+            ("UPDATE t SET name = 'x' WHERE id = 1", true),
+            ("DELETE FROM t WHERE id = 1", true),
+            // COPY: not tested — `state.statement_to_plan` rejects COPY as
+            // unsupported today, so `LogicalPlan::Copy` is unreachable via
+            // the prepared-statement path. The Copy arm in the guard is
+            // defensive for if upstream ever enables it.
+            ("SELECT id, name FROM t", false),
+            // Over-match guard: a SELECT that happens to produce a single
+            // UInt64 `count` column must NOT be suppressed — only DML/COPY
+            // plans of that shape may. If the guard ever drops the
+            // `LogicalPlan::Dml | Copy` check, this case fails loudly.
+            ("SELECT COUNT(*) AS count FROM t", false),
+        ];
+        for (sql, expect_empty) in cases {
+            let stmt = parser.parse_sql(&client, sql, &[]).await.unwrap();
+            let fields = parser.get_result_schema(&stmt, None).unwrap();
+            assert_eq!(
+                fields.is_empty(),
+                *expect_empty,
+                "{sql}: expected empty={expect_empty}, got {fields:?}"
+            );
+        }
     }
 }
