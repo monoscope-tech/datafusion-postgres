@@ -15,7 +15,7 @@ fn extract_placeholder_cast_types(plan: &LogicalPlan) -> Result<HashMap<String, 
             let _ = expr.apply(|e| {
                 if let Expr::Cast(cast) = e {
                     if let Expr::Placeholder(ph) = &*cast.expr {
-                        placeholder_types.insert(ph.id.clone(), Some(cast.data_type.clone()));
+                        placeholder_types.insert(ph.id.clone(), Some(cast.field.data_type().clone()));
                         casted_placeholders.insert(ph.id.clone());
                     }
                 }

@@ -31,6 +31,7 @@ pg_interval = { version = "0.5.1", package = "pg_interval_2" }
 pgwire = { workspace = true, default-features = false, features = ["server-api", "pg-ext-types"] }
 postgres-types.workspace = true
 rust_decimal.workspace = true
+uuid = "1"
 postgis = { version = "0.9", optional = true }
 geo-postgis = { version = "0.2", optional = true }
 geo-traits = { version = "0.3", optional = true }

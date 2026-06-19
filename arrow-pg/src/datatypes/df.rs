@@ -197,13 +197,48 @@ where
                 deserialized_params.push(scalar_value);
             }
             Type::UUID => {
-                let value = portal.parameter::<String>(i, &pg_type)?;
-                // Store UUID as string for now
+                // pgwire's FromSql<String> rejects the UUID OID, and uuid::Uuid
+                // doesn't implement FromSqlText, so neither works through
+                // portal.parameter<T>. Read raw bytes and decode by protocol
+                // format: 16-byte binary or text representation.
+                let raw = portal.parameters.get(i).and_then(|o| o.as_ref());
+                let value = match raw {
+                    None => None,
+                    Some(bytes) if portal.parameter_format.is_binary(i) => Some(
+                        uuid::Uuid::from_slice(bytes)
+                            .map_err(|e| PgWireError::ApiError(format!("uuid binary: {e}").into()))?
+                            .to_string(),
+                    ),
+                    Some(bytes) => Some(
+                        std::str::from_utf8(bytes)
+                            .map_err(|e| PgWireError::ApiError(format!("uuid utf8: {e}").into()))?
+                            .to_string(),
+                    ),
+                };
                 deserialized_params.push(ScalarValue::Utf8(value));
             }
             Type::JSON | Type::JSONB => {
-                let value = portal.parameter::<String>(i, &pg_type)?;
-                // Store JSON as string for now
+                // Same issue as Type::UUID — FromSql<String> rejects JSONB OID.
+                // Binary JSONB framing is [version=0x01][utf8 json]; binary JSON is
+                // raw utf8; text protocol is utf8 directly.
+                let raw = portal.parameters.get(i).and_then(|o| o.as_ref());
+                let is_binary = portal.parameter_format.is_binary(i);
+                let value = match raw {
+                    None => None,
+                    Some(bytes) if is_binary && pg_type == Type::JSONB => {
+                        let body = bytes.get(1..).unwrap_or(&[]);
+                        Some(
+                            std::str::from_utf8(body)
+                                .map_err(|e| PgWireError::ApiError(format!("jsonb utf8: {e}").into()))?
+                                .to_string(),
+                        )
+                    }
+                    Some(bytes) => Some(
+                        std::str::from_utf8(bytes)
+                            .map_err(|e| PgWireError::ApiError(format!("json utf8: {e}").into()))?
+                            .to_string(),
+                    ),
+                };
                 deserialized_params.push(ScalarValue::Utf8(value));
             }
             Type::INTERVAL => {

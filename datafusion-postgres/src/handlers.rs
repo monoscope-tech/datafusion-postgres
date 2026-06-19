@@ -422,8 +422,13 @@ impl QueryParser for Parser {
 fn ordered_param_types(types: &HashMap<String, Option<DataType>>) -> Vec<Option<&DataType>> {
     // Datafusion stores the parameters as a map.  In our case, the keys will be
     // `$1`, `$2` etc.  The values will be the parameter types.
+    //
+    // PATCH (timefusion): the original sorted lexicographically (`a.0.cmp(b.0)`),
+    // which puts `$10` before `$2` and breaks every INSERT/SELECT with more than 9
+    // placeholders — the ParameterDescription returned to the client has the wrong
+    // positional order, so e.g. a uuid gets typed as TIMESTAMPTZ. Sort by numeric suffix.
     let mut types = types.iter().collect::<Vec<_>>();
-    types.sort_by(|a, b| a.0.cmp(b.0));
+    types.sort_by_key(|(k, _)| k.trim_start_matches('$').parse::<u32>().unwrap_or(u32::MAX));
     types.into_iter().map(|pt| pt.1.as_ref()).collect()
 }
 
