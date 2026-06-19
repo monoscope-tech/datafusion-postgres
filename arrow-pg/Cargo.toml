@@ -1,7 +1,7 @@
 [package]
 name = "arrow-pg"
 description = "Arrow data mapping and encoding/decoding for Postgres"
-version = "0.13.0"
+version = "0.14.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -27,7 +27,7 @@ datafusion = { workspace = true, optional = true }
 futures.workspace = true
 geoarrow = { version = "0.8", optional = true }
 geoarrow-schema = { version = "0.8", optional = true }
-pg_interval = { version = "0.5.1", package = "pg_interval_2" }
+pg_interval = { version = "0.5.0" }
 pgwire = { workspace = true, default-features = false, features = ["server-api", "pg-ext-types"] }
 postgres-types.workspace = true
 rust_decimal.workspace = true
@@ -38,4 +38,4 @@ geo-traits = { version = "0.3", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1"
-tokio = { version = "1.50", features = ["full"]}
+tokio = { version = "1.52", features = ["full"]}

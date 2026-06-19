@@ -3,7 +3,7 @@ resolver = "2"
 members = ["datafusion-postgres", "datafusion-postgres-cli", "arrow-pg", "datafusion-pg-catalog"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.89"
 authors = ["Ning Sun <n@sunng.info>"]
@@ -19,9 +19,9 @@ bytes = "1.11.1"
 chrono = { version = "0.4", features = ["std"] }
 datafusion = { version = "54" }
 futures = "0.3"
-pgwire = { version = "0.38", default-features = false }
+pgwire = { version = "0.40", default-features = false }
 postgres-types = "0.2"
-rust_decimal = { version = "1.41", features = ["db-postgres"] }
+rust_decimal = { version = "1.42", features = ["db-postgres"] }
 tokio = { version = "1", default-features = false }
 
 [profile.release]

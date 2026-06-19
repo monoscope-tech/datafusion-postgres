@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "arrow-pg"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -388,7 +388,7 @@ dependencies = [
  "geo-traits",
  "geoarrow",
  "geoarrow-schema",
- "pg_interval_2",
+ "pg_interval",
  "pgwire",
  "postgis",
  "postgres-types",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-pg-catalog"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2228,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-postgres"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-postgres-cli"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "datafusion 54.0.0",
  "datafusion-postgres",
@@ -3679,10 +3679,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_interval_2"
-version = "0.5.1"
+name = "pg_interval"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "469827e70c8c74562f88b9434cf8a8fe35665281d2442304e99efcadf8f76a8f"
+checksum = "c386dd54fce258fc04e668126ae68589a0d92e03a90ea67881d1300f70fd6170"
 dependencies = [
  "bytes",
  "chrono",
@@ -3691,9 +3691,9 @@ dependencies = [
 
 [[package]]
 name = "pgwire"
-version = "0.38.2"
+version = "0.40.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a1bdf05fc8231cc5024572fe056e3ce34eb6b9b755ba7aba110e1c64119cec3"
+checksum = "bdc5af11aa35ec1e23f56699dfd96f70f02822bdac5bddeabfb53795af4cc477"
 dependencies = [
  "async-trait",
  "base64",
@@ -3704,7 +3704,7 @@ dependencies = [
  "hex",
  "lazy-regex",
  "md5",
- "pg_interval_2",
+ "pg_interval",
  "postgis",
  "postgres-types",
  "rand 0.10.0",
@@ -4235,9 +4235,9 @@ dependencies = [
 
 [[package]]
 name = "rust_decimal"
-version = "1.41.0"
+version = "1.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce901f9a19d251159075a4c37af514c3b8ef99c22e02dd8c19161cf397ee94a"
+checksum = "be2a24f50780bc85f09cc6ac299bdf1424302742d77221106859c9d8b102126a"
 dependencies = [
  "arrayvec",
  "borsh",

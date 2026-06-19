@@ -20,8 +20,8 @@ use rustls_pemfile::{certs, pkcs8_private_keys};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{lookup_host, TcpListener, TcpSocket};
 use tokio::sync::Semaphore;
-use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{self, ServerConfig};
 
 use handlers::HandlerFactory;
 pub use handlers::{DfSessionService, Parser};

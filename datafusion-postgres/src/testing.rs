@@ -1,16 +1,21 @@
 use std::{collections::HashMap, sync::Arc};
 
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::sql::sqlparser;
 use datafusion_pg_catalog::pg_catalog::setup_pg_catalog;
 use futures::Sink;
 use pgwire::{
-    api::{ClientInfo, ClientPortalStore, PgWireConnectionState, METADATA_USER},
+    api::{
+        ClientInfo, ClientPortalStore, METADATA_USER, PgWireConnectionState, SessionExtensions,
+        store::MemPortalStore,
+    },
     messages::{
-        response::TransactionStatus, startup::SecretKey, PgWireBackendMessage, ProtocolVersion,
+        PgWireBackendMessage, ProtocolVersion, response::TransactionStatus, startup::SecretKey,
     },
 };
 
-use crate::{auth::AuthManager, DfSessionService};
+use crate::{DfSessionService, auth::AuthManager};
 
 pub fn setup_handlers() -> DfSessionService {
     let session_config = SessionConfig::new().with_information_schema(true);
@@ -26,11 +31,14 @@ pub fn setup_handlers() -> DfSessionService {
     DfSessionService::new(Arc::new(session_context))
 }
 
+type DfStatement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+
 #[derive(Debug, Default)]
 pub struct MockClient {
     metadata: HashMap<String, String>,
-    portal_store: HashMap<String, String>,
+    portal_store: MemPortalStore<DfStatement>,
     pub sent_messages: Vec<PgWireBackendMessage>,
+    session_extensions: SessionExtensions,
 }
 
 impl MockClient {
@@ -40,8 +48,9 @@ impl MockClient {
 
         MockClient {
             metadata,
-            portal_store: HashMap::default(),
+            portal_store: MemPortalStore::new(),
             sent_messages: Vec::new(),
+            session_extensions: SessionExtensions::new(),
         }
     }
 
@@ -98,10 +107,14 @@ impl ClientInfo for MockClient {
     fn sni_server_name(&self) -> Option<&str> {
         None
     }
+
+    fn session_extensions(&self) -> &pgwire::api::SessionExtensions {
+        &self.session_extensions
+    }
 }
 
 impl ClientPortalStore for MockClient {
-    type PortalStore = HashMap<String, String>;
+    type PortalStore = MemPortalStore<DfStatement>;
     fn portal_store(&self) -> &Self::PortalStore {
         &self.portal_store
     }
