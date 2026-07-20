@@ -5,7 +5,7 @@ pub mod transactions;
 
 use async_trait::async_trait;
 
-use datafusion::common::ParamValues;
+use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
@@ -70,6 +70,27 @@ pub trait QueryHook: Send + Sync {
     /// plan as if it had been freshly parsed.
     fn was_pre_optimized(&self, _canonical_sql: &str) -> bool {
         false
+    }
+
+    /// How many trailing placeholders this hook injected into the plan beyond
+    /// the client's binds (see `extra_execute_params`). The Parse/Describe path
+    /// hides exactly this many from the `ParameterDescription` so the client
+    /// still sees only its own params. MUST equal the number of values
+    /// `extra_execute_params` appends for the same statement.
+    fn injected_param_count(&self, _statement: &Statement) -> usize {
+        0
+    }
+
+    /// Extra positional parameter values for placeholders this hook injected
+    /// into the plan at parse time BEYOND the client's bound params (e.g. a
+    /// fresh `now()` instant). Appended to the client's deserialized params
+    /// before `replace_params_with_values`, so those placeholders resolve to a
+    /// fresh value on every execute — correct even for reused (named) prepared
+    /// statements, where the parse hook runs only once. Values are matched by
+    /// placeholder id, so any surplus (a statement the hook did not inject into)
+    /// is ignored; returning `[]` is the safe default.
+    fn extra_execute_params(&self, _statement: &Statement) -> Vec<ScalarValue> {
+        Vec::new()
     }
 
     /// called at extended query execute phase, for query execution

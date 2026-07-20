@@ -344,8 +344,22 @@ impl ExtendedQueryHandler for DfSessionService {
             let param_types = planner::get_inferred_parameter_types(plan)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
-            let param_values =
+            let mut param_values =
                 df::deserialize_parameters(portal, &ordered_param_types(&param_types))?;
+
+            // Let hooks append fresh values for placeholders they injected at
+            // parse time beyond the client's binds (TimeFusion: a fresh now()
+            // per execute for shape-cached now()+$N queries). Appended in $N
+            // order after the client's params; matched by placeholder id, so
+            // surplus is harmless.
+            let extra: Vec<_> = self
+                .query_hooks
+                .iter()
+                .flat_map(|h| h.extra_execute_params(_statement))
+                .collect();
+            if !extra.is_empty() && let ParamValues::List(list) = &mut param_values {
+                list.extend(extra.into_iter().map(Into::into));
+            }
 
             let plan = plan
                 .clone()
@@ -498,7 +512,7 @@ impl QueryParser for Parser {
     }
 
     fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
-        if let (_, Some((_, plan))) = stmt {
+        if let (_, Some((statement, plan))) = stmt {
             let params = planner::get_inferred_parameter_types(plan)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
@@ -511,6 +525,13 @@ impl QueryParser for Parser {
                     param_types.push(Type::UNKNOWN);
                 }
             }
+
+            // Hide hook-injected trailing placeholders (e.g. now() the plan cache
+            // parameterized above the client's binds) so the client's
+            // ParameterDescription still reports only its own params. They are
+            // the highest-numbered ($N) placeholders, so they sort last.
+            let injected: usize = self.query_hooks.iter().map(|h| h.injected_param_count(statement)).sum();
+            param_types.truncate(param_types.len().saturating_sub(injected));
 
             Ok(param_types)
         } else {
