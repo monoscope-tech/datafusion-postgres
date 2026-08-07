@@ -77,7 +77,10 @@ pub trait QueryHook: Send + Sync {
     /// hides exactly this many from the `ParameterDescription` so the client
     /// still sees only its own params. MUST equal the number of values
     /// `extra_execute_params` appends for the same statement.
-    fn injected_param_count(&self, _statement: &Statement) -> usize {
+    /// `None` when the AST was not retained past Parse — see
+    /// [`crate::handlers::retains_ast`]; no such statement carries an
+    /// injected placeholder, so the count is zero.
+    fn injected_param_count(&self, _statement: Option<&Statement>) -> usize {
         0
     }
 
@@ -89,14 +92,24 @@ pub trait QueryHook: Send + Sync {
     /// statements, where the parse hook runs only once. Values are matched by
     /// placeholder id, so any surplus (a statement the hook did not inject into)
     /// is ignored; returning `[]` is the safe default.
-    fn extra_execute_params(&self, _statement: &Statement) -> Vec<ScalarValue> {
+    /// `None` when the statement's AST was not retained past Parse — see
+    /// [`crate::handlers::retains_ast`]. Only bulk data statements arrive that
+    /// way, and none of them can carry an injected placeholder.
+    fn extra_execute_params(&self, _statement: Option<&Statement>) -> Vec<ScalarValue> {
         Vec::new()
     }
 
-    /// called at extended query execute phase, for query execution
+    /// called at extended query execute phase, for query execution.
+    ///
+    /// `statement` is `None` when the AST was not retained past Parse (see
+    /// [`crate::handlers::retains_ast`]): a bulk INSERT/UPDATE/DELETE/COPY,
+    /// whose AST is the single largest thing a prepared statement can pin. A
+    /// hook that dispatches on statement kind must decline on `None` — the
+    /// kinds those hooks care about (SET/SHOW/DECLARE/transaction control) are
+    /// always retained.
     async fn handle_extended_query(
         &self,
-        statement: &Statement,
+        statement: Option<&Statement>,
         logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,

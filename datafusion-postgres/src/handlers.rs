@@ -287,7 +287,7 @@ impl SimpleQueryHandler for DfSessionService {
 
 #[async_trait]
 impl ExtendedQueryHandler for DfSessionService {
-    type Statement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+    type Statement = ParsedStatement;
     type QueryParser = Parser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
@@ -327,7 +327,7 @@ impl ExtendedQueryHandler for DfSessionService {
             for hook in &self.query_hooks {
                 if let Some(result) = hook
                     .handle_extended_query(
-                        statement,
+                        statement.as_ref(),
                         plan,
                         &param_values,
                         &self.session_context,
@@ -355,7 +355,7 @@ impl ExtendedQueryHandler for DfSessionService {
             let extra: Vec<_> = self
                 .query_hooks
                 .iter()
-                .flat_map(|h| h.extra_execute_params(_statement))
+                .flat_map(|h| h.extra_execute_params(_statement.as_ref()))
                 .collect();
             if !extra.is_empty() && let ParamValues::List(list) = &mut param_values {
                 list.extend(extra.into_iter().map(Into::into));
@@ -459,6 +459,42 @@ async fn dml_completion(df: &DataFrame) -> PgWireResult<Option<Response>> {
     Ok(Some(Response::Execution(tag.with_rows(rows))))
 }
 
+/// A prepared statement as the portal store holds it, for the life of the
+/// statement: canonical SQL, plus the planned form when the text parsed to one.
+///
+/// The AST is `Option` because a prepared statement PINS everything in here.
+/// A bulk `INSERT ... VALUES (...), (...), …` parses to an AST proportional to
+/// the payload, and on TimeFusion's ingest path that AST was the single largest
+/// resident object in the process — 35-42% of live heap across mid-run jemalloc
+/// dumps (2026-08-07), growing ~1 GB/min because every distinct batch size is a
+/// distinct prepared statement the client never closes. Nothing reads it after
+/// Parse: execution runs off the `LogicalPlan`, and the hooks that dispatch on
+/// statement kind only ever match control statements. See [`retains_ast`].
+pub type ParsedStatement = (
+    String,
+    Option<(Option<sqlparser::ast::Statement>, LogicalPlan)>,
+);
+
+/// Whether a statement's AST is worth pinning for the life of the prepared
+/// statement. Bulk data statements are the ones that get huge and the ones no
+/// execute-time consumer needs: `handle_extended_query` implementations match
+/// on SET / SHOW / DECLARE / transaction control, and `extra_execute_params`
+/// only injects into `Statement::Query`. Everything else is small enough that
+/// keeping it costs nothing.
+fn retains_ast(statement: &sqlparser::ast::Statement) -> bool {
+    !matches!(
+        statement,
+        sqlparser::ast::Statement::Insert(_)
+            | sqlparser::ast::Statement::Update { .. }
+            | sqlparser::ast::Statement::Delete(_)
+            | sqlparser::ast::Statement::Copy { .. }
+    )
+}
+
+fn retained_ast(statement: sqlparser::ast::Statement) -> Option<sqlparser::ast::Statement> {
+    retains_ast(&statement).then_some(statement)
+}
+
 pub struct Parser {
     session_context: Arc<SessionContext>,
     sql_parser: PostgresCompatibilityParser,
@@ -467,7 +503,7 @@ pub struct Parser {
 
 #[async_trait]
 impl QueryParser for Parser {
-    type Statement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+    type Statement = ParsedStatement;
 
     async fn parse_sql<C>(
         &self,
@@ -500,7 +536,7 @@ impl QueryParser for Parser {
                 .handle_extended_parse_query(&statement, context, client)
                 .await
             {
-                return Ok((query, Some((statement, logical_plan?))));
+                return Ok((query, Some((retained_ast(statement), logical_plan?))));
             }
         }
 
@@ -508,7 +544,7 @@ impl QueryParser for Parser {
             .statement_to_plan(Statement::Statement(Box::new(statement.clone())))
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-        Ok((query, Some((statement, logical_plan))))
+        Ok((query, Some((retained_ast(statement), logical_plan))))
     }
 
     fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
@@ -530,7 +566,7 @@ impl QueryParser for Parser {
             // parameterized above the client's binds) so the client's
             // ParameterDescription still reports only its own params. They are
             // the highest-numbered ($N) placeholders, so they sort last.
-            let injected: usize = self.query_hooks.iter().map(|h| h.injected_param_count(statement)).sum();
+            let injected: usize = self.query_hooks.iter().map(|h| h.injected_param_count(statement.as_ref())).sum();
             param_types.truncate(param_types.len().saturating_sub(injected));
 
             Ok(param_types)
@@ -624,13 +660,43 @@ mod tests {
 
         async fn handle_extended_query(
             &self,
-            _statement: &sqlparser::ast::Statement,
+            _statement: Option<&sqlparser::ast::Statement>,
             _logical_plan: &LogicalPlan,
             _params: &ParamValues,
             _session_context: &SessionContext,
             _client: &mut dyn HookClient,
         ) -> Option<PgWireResult<Response>> {
             None
+        }
+    }
+
+    /// A prepared statement pins whatever `parse_sql` returns. Bulk data
+    /// statements must not pin their AST (2026-08-07: 35-42% of TimeFusion's
+    /// live heap), and everything the execute-time hooks dispatch on must.
+    #[test]
+    fn bulk_data_statements_do_not_pin_their_ast() {
+        let parse = |sql: &str| {
+            PostgresCompatibilityParser::new()
+                .parse(sql)
+                .unwrap()
+                .remove(0)
+        };
+        for sql in [
+            "INSERT INTO t VALUES (1), (2)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+        ] {
+            assert!(retained_ast(parse(sql)).is_none(), "must not pin: {sql}");
+        }
+        for sql in [
+            "SET x = 1",
+            "SHOW ALL",
+            "BEGIN",
+            "COMMIT",
+            "DECLARE c CURSOR FOR SELECT 1",
+            "SELECT 1",
+        ] {
+            assert!(retained_ast(parse(sql)).is_some(), "must pin: {sql}");
         }
     }
 

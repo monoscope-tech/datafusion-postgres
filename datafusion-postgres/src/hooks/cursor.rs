@@ -65,12 +65,14 @@ impl QueryHook for CursorStatementHook {
 
     async fn handle_extended_query(
         &self,
-        statement: &sqlparser::ast::Statement,
+        statement: Option<&sqlparser::ast::Statement>,
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        // A dropped AST is only ever a bulk data statement, never DECLARE/FETCH.
+        let statement = statement?;
         let store = client.portal_store();
 
         match statement {

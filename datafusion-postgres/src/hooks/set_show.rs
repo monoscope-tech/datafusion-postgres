@@ -84,12 +84,14 @@ impl QueryHook for SetShowHook {
 
     async fn handle_extended_query(
         &self,
-        statement: &Statement,
+        statement: Option<&Statement>,
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        // A dropped AST is only ever a bulk data statement, never SET/SHOW.
+        let statement = statement?;
         match statement {
             Statement::Set { .. } => {
                 try_respond_set_statements(client, statement, session_context).await
