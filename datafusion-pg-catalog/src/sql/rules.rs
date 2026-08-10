@@ -914,7 +914,7 @@ impl SqlStatementRewriteRule for RemoveQualifier {
     }
 }
 
-/// Replace `current_user` with `session_user()`
+/// Normalize PostgreSQL's bare current-user forms to `session_user`.
 #[derive(Debug)]
 pub struct CurrentUserVariableToSessionUserFunctionCall;
 
@@ -926,7 +926,7 @@ impl VisitorMut for CurrentUserVariableToSessionUserFunctionCallVisitor {
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::Identifier(ident) = expr
             && ident.quote_style.is_none()
-            && ident.value.to_lowercase() == "current_user"
+            && matches!(ident.value.to_ascii_lowercase().as_str(), "current_user" | "session_user" | "user")
         {
             *expr = Expr::Function(Function {
                 name: ObjectName::from(vec![Ident::new("session_user")]),
@@ -948,7 +948,7 @@ impl VisitorMut for CurrentUserVariableToSessionUserFunctionCallVisitor {
                 .map(|ident| ident.to_string())
                 .collect::<Vec<String>>()
                 .join(".");
-            if fname.to_lowercase() == "current_user" {
+            if matches!(fname.to_ascii_lowercase().as_str(), "current_user" | "session_user" | "user") {
                 func.name = ObjectName::from(vec![Ident::new("session_user")])
             }
         }
@@ -1437,6 +1437,8 @@ mod tests {
         assert_rewrite!(&rules, "SELECT current_user", "SELECT session_user");
 
         assert_rewrite!(&rules, "SELECT CURRENT_USER", "SELECT session_user");
+        assert_rewrite!(&rules, "SELECT SESSION_USER", "SELECT session_user");
+        assert_rewrite!(&rules, "SELECT USER", "SELECT session_user");
 
         assert_rewrite!(
             &rules,
