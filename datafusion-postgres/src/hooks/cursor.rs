@@ -16,7 +16,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use super::{HookClient, QueryHook};
 use crate::arrow_pg::datatypes::df;
 
-pub(crate) type DfStatement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+pub(crate) type DfStatement = crate::handlers::ParsedStatement;
 
 /// Hook for processing cursor-related statements (DECLARE/FETCH/CLOSE)
 #[derive(Debug)]
