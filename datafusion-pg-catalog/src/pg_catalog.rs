@@ -4,9 +4,10 @@ use std::sync::atomic::AtomicU32;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    ArrayRef, AsArray, BooleanBuilder, Int32Builder, RecordBatch, StringArray, StringBuilder,
-    as_boolean_array,
+    ArrayRef, AsArray, BooleanBuilder, Int32Builder, Int64Array, RecordBatch, StringArray,
+    StringBuilder, UInt64Array, as_boolean_array,
 };
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, SchemaRef};
 use datafusion::arrow::ipc::reader::FileReader;
 use datafusion::catalog::streaming::StreamingTable;
@@ -15,7 +16,8 @@ use datafusion::common::utils::SingleRowListArrayBuilder;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::{Expr, SessionContext, create_udf};
@@ -1084,6 +1086,63 @@ pub fn create_current_database_udf() -> ScalarUDF {
     )
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ArrayUpperUdf {
+    signature: Signature,
+}
+
+impl Default for ArrayUpperUdf {
+    fn default() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ArrayUpperUdf {
+    fn name(&self) -> &str {
+        "array_upper"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int64)
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let number_rows = args.number_rows;
+        args.args[1] = ColumnarValue::Array(cast(
+            &args.args[1].to_array(number_rows)?,
+            &DataType::Int64,
+        )?);
+        let lengths = datafusion::functions_nested::length::ArrayLength::default()
+            .invoke_with_args(args)?
+            .to_array(number_rows)?;
+        let lengths = lengths
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("array_upper produced a non-UInt64 result".to_string())
+            })?;
+        let upper_bounds: Int64Array = lengths
+            .iter()
+            .map(|length| {
+                length
+                    .filter(|length| *length != 0)
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        DataFusionError::Execution("array_upper result exceeds Int64".to_string())
+                    })
+            })
+            .collect::<Result<_>>()?;
+        Ok(ColumnarValue::Array(Arc::new(upper_bounds)))
+    }
+}
+
 pub fn create_pg_get_userbyid_udf() -> ScalarUDF {
     // Define the function implementation
     let func = move |args: &[ColumnarValue]| {
@@ -1460,6 +1519,7 @@ where
         "has_any_column_privilege",
     ));
     session_context.register_udf(create_pg_table_is_visible());
+    session_context.register_udf(ScalarUDF::from(ArrayUpperUdf::default()));
     session_context.register_udf(format_type::create_format_type_udf());
     session_context.register_udf(create_session_user_udf());
     session_context.register_udtf("pg_get_keywords", static_tables.pg_get_keywords.clone());

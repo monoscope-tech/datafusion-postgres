@@ -386,7 +386,10 @@ impl SqlStatementRewriteRule for RemoveUnsupportedTypes {
 /// This rewrites patterns like `$1::regclass::oid` to
 /// `(SELECT oid FROM pg_catalog.pg_class WHERE relname = $1)`
 #[derive(Debug)]
-pub struct RewriteRegclassCastToSubquery(Box<Query>);
+pub struct RewriteRegclassCastToSubquery {
+    relation_query: Box<Query>,
+    namespace_query: Box<Query>,
+}
 
 impl Default for RewriteRegclassCastToSubquery {
     fn default() -> Self {
@@ -396,7 +399,19 @@ impl Default for RewriteRegclassCastToSubquery {
 
 impl RewriteRegclassCastToSubquery {
     pub fn new() -> Self {
-        let sql = "SELECT c.oid
+        fn query(sql: &str) -> Box<Query> {
+            let dialect = PostgreSqlDialect {};
+            Parser::parse_sql(&dialect, sql)
+                .map(|mut stmts| match stmts.remove(0) {
+                    Statement::Query(query) => query,
+                    _ => unreachable!(),
+                })
+                .expect("Failed to parse prepared query")
+        }
+
+        Self {
+            relation_query: query(
+                "SELECT c.oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 CROSS JOIN (SELECT parse_ident($1::TEXT) AS parts) p
@@ -404,30 +419,27 @@ WHERE n.nspname = COALESCE(
     CASE WHEN array_length(p.parts, 1) > 1 THEN p.parts[1] END,
     current_schema()
 )
-AND c.relname = p.parts[-1]";
-        let dialect = PostgreSqlDialect {};
-        let query = Parser::parse_sql(&dialect, sql)
-            .map(|mut stmts| {
-                let stmt = stmts.remove(0);
-                if let Statement::Query(query) = stmt {
-                    query
-                } else {
-                    unreachable!()
-                }
-            })
-            .expect("Failed to parse prepared query");
-        Self(query)
+AND c.relname = p.parts[-1]",
+            ),
+            namespace_query: query("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $1"),
+        }
     }
 }
 
-struct RewriteRegclassCastToSubqueryVisitor(Box<Query>);
+struct RewriteRegclassCastToSubqueryVisitor {
+    relation_query: Box<Query>,
+    namespace_query: Box<Query>,
+}
 
 impl RewriteRegclassCastToSubqueryVisitor {
-    pub fn new(query: Box<Query>) -> Self {
-        Self(query)
+    pub fn new(relation_query: Box<Query>, namespace_query: Box<Query>) -> Self {
+        Self {
+            relation_query,
+            namespace_query,
+        }
     }
 
-    fn create_subquery(&self, expr: &Expr) -> Expr {
+    fn create_subquery(query: &Query, expr: &Expr) -> Expr {
         struct PlaceholderReplacer(Expr);
 
         impl VisitorMut for PlaceholderReplacer {
@@ -445,10 +457,18 @@ impl RewriteRegclassCastToSubqueryVisitor {
             }
         }
 
-        let mut query = self.0.clone();
+        let mut query = Box::new(query.clone());
         let mut replacer = PlaceholderReplacer(expr.clone());
         let _ = query.visit(&mut replacer);
         Expr::Subquery(query)
+    }
+
+    fn create_relation_subquery(&self, expr: &Expr) -> Expr {
+        Self::create_subquery(&self.relation_query, expr)
+    }
+
+    fn create_namespace_subquery(&self, expr: &Expr) -> Expr {
+        Self::create_subquery(&self.namespace_query, expr)
     }
 
     fn is_regclass_to_oid_cast(&self, expr: &Expr) -> bool {
@@ -514,6 +534,42 @@ impl RewriteRegclassCastToSubqueryVisitor {
         }
         None
     }
+
+    fn is_relnamespace(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("relnamespace"),
+            Expr::CompoundIdentifier(idents) => idents
+                .last()
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("relnamespace")),
+            _ => false,
+        }
+    }
+
+    fn string_literal(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(_),
+                ..
+            })
+        )
+    }
+
+    fn rewrite_relnamespace_comparison(&self, expr: &mut Expr) {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = expr
+        else {
+            return;
+        };
+        if Self::is_relnamespace(left) && Self::string_literal(right) {
+            *right = Box::new(self.create_namespace_subquery(right));
+        } else if Self::is_relnamespace(right) && Self::string_literal(left) {
+            *left = Box::new(self.create_namespace_subquery(left));
+        }
+    }
 }
 
 impl VisitorMut for RewriteRegclassCastToSubqueryVisitor {
@@ -523,35 +579,28 @@ impl VisitorMut for RewriteRegclassCastToSubqueryVisitor {
         if self.is_regclass_to_oid_cast(expr)
             && let Some(inner_expr) = self.extract_inner_expr(expr)
         {
-            *expr = self.create_subquery(&inner_expr);
+            *expr = self.create_relation_subquery(&inner_expr);
         } else if self.is_regclass_cast(expr) {
-            // Bare `'name'::regclass` (e.g. `'pg_class'::regclass`, common in DBeaver /
-            // Metabase introspection JOINs). On DataFusion 54 `simplify_expressions`
-            // eagerly constant-folds the raw string→oid cast and fails. regclass
-            // resolves a relation name to its oid, so rewrite to the same pg_class
-            // oid subquery used for the `::regclass::oid` double-cast case.
-            //
-            // Only the name→oid direction: the inner must be a string literal or a
-            // bind placeholder. Do NOT touch `oid_col::regclass` (the inverse oid→name
-            // display cast, e.g. `c.oid::regclass::text` in psql), which would become a
-            // correlated subquery over the oid column.
             let inner = match expr {
-                Expr::Cast { expr: inner_expr, .. }
-                    if matches!(
-                        inner_expr.as_ref(),
-                        Expr::Value(ValueWithSpan {
-                            value: Value::SingleQuotedString(_) | Value::Placeholder(_),
-                            ..
-                        })
-                    ) =>
+                Expr::Cast {
+                    expr: inner_expr, ..
+                } if matches!(
+                    inner_expr.as_ref(),
+                    Expr::Value(ValueWithSpan {
+                        value: Value::SingleQuotedString(_) | Value::Placeholder(_),
+                        ..
+                    })
+                ) =>
                 {
                     Some((**inner_expr).clone())
                 }
                 _ => None,
             };
             if let Some(inner) = inner {
-                *expr = self.create_subquery(&inner);
+                *expr = self.create_relation_subquery(&inner);
             }
+        } else {
+            self.rewrite_relnamespace_comparison(expr);
         }
         ControlFlow::Continue(())
     }
@@ -559,7 +608,10 @@ impl VisitorMut for RewriteRegclassCastToSubqueryVisitor {
 
 impl SqlStatementRewriteRule for RewriteRegclassCastToSubquery {
     fn rewrite(&self, mut s: Statement) -> Statement {
-        let mut visitor = RewriteRegclassCastToSubqueryVisitor::new(self.0.clone());
+        let mut visitor = RewriteRegclassCastToSubqueryVisitor::new(
+            self.relation_query.clone(),
+            self.namespace_query.clone(),
+        );
         let _ = s.visit(&mut visitor);
         s
     }
