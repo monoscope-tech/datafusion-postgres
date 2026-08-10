@@ -13,6 +13,7 @@ use super::rules::CurrentUserVariableToSessionUserFunctionCall;
 use super::rules::FixArrayLiteral;
 use super::rules::FixCollate;
 use super::rules::FixVersionColumnName;
+use super::rules::FlattenPartitionAncestorsInSubquery;
 use super::rules::PrependUnqualifiedPgTableName;
 use super::rules::RemoveQualifier;
 use super::rules::RemoveSubqueryFromProjection;
@@ -230,6 +231,7 @@ impl PostgresCompatibilityParser {
                 Arc::new(RewriteArrayAnyAllOperation),
                 Arc::new(PrependUnqualifiedPgTableName),
                 Arc::new(RemoveQualifier),
+                Arc::new(FlattenPartitionAncestorsInSubquery),
                 Arc::new(RewriteRegclassCastToSubquery::new()),
                 Arc::new(RemoveUnsupportedTypes::new()),
                 Arc::new(FixArrayLiteral),

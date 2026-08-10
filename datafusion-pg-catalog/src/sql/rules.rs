@@ -23,6 +23,8 @@ use datafusion::sql::sqlparser::ast::Select;
 use datafusion::sql::sqlparser::ast::SelectItem;
 use datafusion::sql::sqlparser::ast::SelectItemQualifiedWildcardKind;
 use datafusion::sql::sqlparser::ast::SetExpr;
+use datafusion::sql::sqlparser::ast::SetOperator;
+use datafusion::sql::sqlparser::ast::SetQuantifier;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::ast::TableFactor;
 use datafusion::sql::sqlparser::ast::TableWithJoins;
@@ -914,6 +916,85 @@ impl SqlStatementRewriteRule for RemoveQualifier {
     }
 }
 
+/// Flatten psql's partition-ancestor `IN` subquery before regclass casts turn
+/// the `VALUES` side into a scalar subquery that DataFusion 54 cannot execute.
+#[derive(Debug)]
+pub struct FlattenPartitionAncestorsInSubquery;
+
+struct FlattenPartitionAncestorsInSubqueryVisitor;
+
+impl FlattenPartitionAncestorsInSubqueryVisitor {
+    fn rewrite(expr: &Expr) -> Option<Expr> {
+        let Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } = expr
+        else {
+            return None;
+        };
+        let SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            left,
+            right,
+        } = subquery.body.as_ref()
+        else {
+            return None;
+        };
+        let SetExpr::Select(select) = left.as_ref() else {
+            return None;
+        };
+        let [SelectItem::UnnamedExpr(ancestor)] = select.projection.as_slice() else {
+            return None;
+        };
+        let Expr::Function(function) = ancestor else {
+            return None;
+        };
+        if !select.from.is_empty()
+            || !function
+                .name
+                .to_string()
+                .eq_ignore_ascii_case("pg_partition_ancestors")
+        {
+            return None;
+        }
+        let SetExpr::Values(values) = right.as_ref() else {
+            return None;
+        };
+        let [value_row] = values.rows.as_slice() else {
+            return None;
+        };
+        let [value] = value_row.content.as_slice() else {
+            return None;
+        };
+        Some(Expr::InList {
+            expr: expr.clone(),
+            list: vec![ancestor.clone(), value.clone()],
+            negated: *negated,
+        })
+    }
+}
+
+impl VisitorMut for FlattenPartitionAncestorsInSubqueryVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Some(rewritten) = Self::rewrite(expr) {
+            *expr = rewritten;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl SqlStatementRewriteRule for FlattenPartitionAncestorsInSubquery {
+    fn rewrite(&self, mut s: Statement) -> Statement {
+        let mut visitor = FlattenPartitionAncestorsInSubqueryVisitor;
+        let _ = s.visit(&mut visitor);
+        s
+    }
+}
+
 /// Normalize PostgreSQL's bare current-user forms to `session_user`.
 #[derive(Debug)]
 pub struct CurrentUserVariableToSessionUserFunctionCall;
@@ -926,7 +1007,10 @@ impl VisitorMut for CurrentUserVariableToSessionUserFunctionCallVisitor {
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::Identifier(ident) = expr
             && ident.quote_style.is_none()
-            && matches!(ident.value.to_ascii_lowercase().as_str(), "current_user" | "session_user" | "user")
+            && matches!(
+                ident.value.to_ascii_lowercase().as_str(),
+                "current_user" | "session_user" | "user"
+            )
         {
             *expr = Expr::Function(Function {
                 name: ObjectName::from(vec![Ident::new("session_user")]),
@@ -948,7 +1032,10 @@ impl VisitorMut for CurrentUserVariableToSessionUserFunctionCallVisitor {
                 .map(|ident| ident.to_string())
                 .collect::<Vec<String>>()
                 .join(".");
-            if matches!(fname.to_ascii_lowercase().as_str(), "current_user" | "session_user" | "user") {
+            if matches!(
+                fname.to_ascii_lowercase().as_str(),
+                "current_user" | "session_user" | "user"
+            ) {
                 func.name = ObjectName::from(vec![Ident::new("session_user")])
             }
         }
@@ -1426,6 +1513,19 @@ mod tests {
             &rules,
             "SELECT * FROM pg_catalog.pg_get_keywords()",
             "SELECT * FROM pg_get_keywords()"
+        );
+    }
+
+    #[test]
+    fn test_flatten_partition_ancestors_in_subquery() {
+        let rules: Vec<Arc<dyn SqlStatementRewriteRule>> = vec![
+            Arc::new(RemoveQualifier),
+            Arc::new(FlattenPartitionAncestorsInSubquery),
+        ];
+        assert_rewrite!(
+            &rules,
+            "SELECT * FROM pg_constraint WHERE confrelid IN (SELECT pg_catalog.pg_partition_ancestors('1') UNION ALL VALUES ('1'::regclass))",
+            "SELECT * FROM pg_constraint WHERE confrelid IN (pg_partition_ancestors('1'), '1'::REGCLASS)"
         );
     }
 
