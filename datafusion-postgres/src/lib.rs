@@ -18,7 +18,7 @@ use pgwire::api::PgWireServerHandlers;
 use pgwire::tokio::process_socket;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::{lookup_host, TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, lookup_host};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{self, ServerConfig};
@@ -71,7 +71,8 @@ fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
     // Install ring crypto provider for rustls
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cert = certs(&mut BufReader::new(File::open(cert_path)?)).collect::<Result<Vec<CertificateDer>, IOError>>()?;
+    let cert = certs(&mut BufReader::new(File::open(cert_path)?))
+        .collect::<Result<Vec<CertificateDer>, IOError>>()?;
 
     let key = pkcs8_private_keys(&mut BufReader::new(File::open(key_path)?))
         .map(|key| key.map(PrivateKeyDer::from))
@@ -89,7 +90,10 @@ fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
 }
 
 /// Serve the Datafusion `SessionContext` with Postgres protocol.
-pub async fn serve(session_context: Arc<SessionContext>, opts: &ServerOptions) -> Result<(), std::io::Error> {
+pub async fn serve(
+    session_context: Arc<SessionContext>,
+    opts: &ServerOptions,
+) -> Result<(), std::io::Error> {
     #[cfg(feature = "postgis")]
     geodatafusion::register(&session_context);
 
@@ -101,7 +105,11 @@ pub async fn serve(session_context: Arc<SessionContext>, opts: &ServerOptions) -
 
 /// Serve the Datafusion `SessionContext` with Postgres protocol, using custom
 /// query processing hooks.
-pub async fn serve_with_hooks(session_context: Arc<SessionContext>, opts: &ServerOptions, hooks: Vec<Arc<dyn QueryHook>>) -> Result<(), std::io::Error> {
+pub async fn serve_with_hooks(
+    session_context: Arc<SessionContext>,
+    opts: &ServerOptions,
+    hooks: Vec<Arc<dyn QueryHook>>,
+) -> Result<(), std::io::Error> {
     #[cfg(feature = "postgis")]
     geodatafusion::register(&session_context);
 
@@ -122,7 +130,9 @@ pub async fn serve_with_hooks(session_context: Arc<SessionContext>, opts: &Serve
 /// listener just stops minting new ones. Pass `std::future::pending()` (or
 /// equivalent never-firing future) if you don't need shutdown signalling.
 pub async fn serve_with_handlers(
-    handlers: Arc<impl PgWireServerHandlers + Sync + Send + 'static>, opts: &ServerOptions, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    handlers: Arc<impl PgWireServerHandlers + Sync + Send + 'static>,
+    opts: &ServerOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     let listener = bind_listener(&opts.host, opts.port, opts.backlog).await?;
     serve_with_listener(listener, handlers, opts, shutdown).await
@@ -132,18 +142,28 @@ pub async fn serve_with_handlers(
 /// `backlog` — `TcpListener::bind` hardcodes 128 via mio, which trivially
 /// overflows under thundering-herd reconnects. The kernel still clamps to
 /// `somaxconn`, so the host sysctl must match.
-pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpListener, std::io::Error> {
+pub async fn bind_listener(
+    host: &str,
+    port: u16,
+    backlog: u32,
+) -> Result<TcpListener, std::io::Error> {
     let server_addr = format!("{host}:{port}");
     // Skip the async resolver round-trip when host parses as a literal IP
     // (the common 0.0.0.0 / :: case). lookup_host is only needed for names.
     let addr = match server_addr.parse::<SocketAddr>() {
         Ok(a) => a,
-        Err(_) => lookup_host(&server_addr)
-            .await?
-            .next()
-            .ok_or_else(|| IOError::new(ErrorKind::InvalidInput, format!("could not resolve {server_addr}")))?,
+        Err(_) => lookup_host(&server_addr).await?.next().ok_or_else(|| {
+            IOError::new(
+                ErrorKind::InvalidInput,
+                format!("could not resolve {server_addr}"),
+            )
+        })?,
     };
-    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
     // SO_REUSEADDR on Linux/macOS only governs TIME_WAIT reuse. On Windows it
     // additionally allows another process to steal the port — so skip it
     // there to keep the dev experience safe.
@@ -151,7 +171,9 @@ pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpLis
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     let listener = socket.listen(backlog)?;
-    info!("Bound PGWire listener on {server_addr} (backlog={backlog}); kernel clamps to net.core.somaxconn");
+    info!(
+        "Bound PGWire listener on {server_addr} (backlog={backlog}); kernel clamps to net.core.somaxconn"
+    );
     Ok(listener)
 }
 
@@ -162,37 +184,51 @@ pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpLis
 /// avoiding the unbound-port window that causes ECONNREFUSED at clients
 /// during slow startup).
 pub async fn serve_with_listener(
-    listener: TcpListener, handlers: Arc<impl PgWireServerHandlers + Sync + Send + 'static>, opts: &ServerOptions,
+    listener: TcpListener,
+    handlers: Arc<impl PgWireServerHandlers + Sync + Send + 'static>,
+    opts: &ServerOptions,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     // Set up TLS if configured
-    let tls_acceptor = if let (Some(cert_path), Some(key_path)) = (&opts.tls_cert_path, &opts.tls_key_path) {
-        match setup_tls(cert_path, key_path) {
-            Ok(acceptor) => {
-                info!("TLS enabled using cert: {cert_path} and key: {key_path}");
-                Some(acceptor)
+    let tls_acceptor =
+        if let (Some(cert_path), Some(key_path)) = (&opts.tls_cert_path, &opts.tls_key_path) {
+            match setup_tls(cert_path, key_path) {
+                Ok(acceptor) => {
+                    info!("TLS enabled using cert: {cert_path} and key: {key_path}");
+                    Some(acceptor)
+                }
+                Err(e) => {
+                    warn!("Failed to setup TLS: {e}. Running without encryption.");
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Failed to setup TLS: {e}. Running without encryption.");
-                None
-            }
-        }
-    } else {
-        info!("TLS not configured. Running without encryption.");
-        None
-    };
+        } else {
+            info!("TLS not configured. Running without encryption.");
+            None
+        };
 
     // Note: opts.host / opts.port / opts.backlog reflect the options object,
     // not necessarily the listening socket — callers passing a pre-bound
     // listener may have used different values at bind time. Only TLS config
     // and connection-limit fields from opts affect behaviour from here on.
-    let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
-    let tls_label = if tls_acceptor.is_some() { "TLS" } else { "unencrypted" };
+    let local_addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let tls_label = if tls_acceptor.is_some() {
+        "TLS"
+    } else {
+        "unencrypted"
+    };
     info!("Listening on {local_addr} ({tls_label})");
 
     // Connection limiter (if configured)
     let max_conn_count = opts.max_connections;
-    let connection_limiter = if max_conn_count > 0 { Some(Arc::new(Semaphore::new(max_conn_count))) } else { None };
+    let connection_limiter = if max_conn_count > 0 {
+        Some(Arc::new(Semaphore::new(max_conn_count)))
+    } else {
+        None
+    };
 
     // Accept incoming connections until `shutdown` resolves. Existing
     // connections keep going on their spawned tasks — they're not cancelled
