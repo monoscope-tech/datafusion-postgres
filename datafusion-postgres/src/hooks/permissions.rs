@@ -124,12 +124,23 @@ impl QueryHook for PermissionsHook {
 
     async fn handle_extended_query(
         &self,
-        statement: &Statement,
+        statement: Option<&Statement>,
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         _session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        // Fail closed: this hook authorizes by statement kind, so without an
+        // AST it cannot authorize statements from an external portal store.
+        let Some(statement) = statement else {
+            return Some(Err(PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42501".to_owned(),
+                    "permission check unavailable: statement AST not retained".to_owned(),
+                ),
+            ))));
+        };
         if Self::should_skip_permission_check(statement) {
             return None;
         }

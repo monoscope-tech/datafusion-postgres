@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,6 +32,61 @@ use crate::{client, planner};
 use arrow_pg::datatypes::df;
 use arrow_pg::datatypes::{arrow_schema_to_pg_fields, into_pg_type};
 use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+
+#[cfg(test)]
+mod deferred_tests;
+
+/// Rewrites Postgres command synonyms that DataFusion's SQL parser doesn't
+/// recognize. Applied to every incoming SQL string before parsing — covers
+/// both the simple-query and extended-query (parse) paths.
+///
+/// Currently handles:
+/// - `ABORT [ WORK | TRANSACTION ]` → `ROLLBACK [ WORK | TRANSACTION ]`.
+///   Postgres treats these as synonyms; Hasql's connection pool emits
+///   `ABORT` defensively on session acquisition, which would otherwise
+///   produce `sql parser error: Expected: an SQL statement, found: ABORT`
+///   and poison the session.
+///
+/// Returns `Cow::Borrowed` on the no-rewrite fast path so the common case
+/// pays only a short case-insensitive prefix check.
+fn rewrite_postgres_synonyms(sql: &str) -> std::borrow::Cow<'_, str> {
+    let stripped = sql.trim_start();
+    let Some((head, rest)) = stripped.split_at_checked(5) else {
+        return std::borrow::Cow::Borrowed(sql);
+    };
+    if !head.eq_ignore_ascii_case("ABORT") {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    // Only treat as the command form when ABORT stands alone (not when it's
+    // a prefix of an identifier like `aborted`).
+    if !(rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')) {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    std::borrow::Cow::Owned(format!("ROLLBACK{}", rest))
+}
+
+#[cfg(test)]
+mod synonym_tests {
+    use super::rewrite_postgres_synonyms as r;
+
+    #[test]
+    fn rewrites_abort_forms() {
+        assert_eq!(r("ABORT"), "ROLLBACK");
+        assert_eq!(r("ABORT;"), "ROLLBACK;");
+        assert_eq!(r("  abort  "), "ROLLBACK  ");
+        assert_eq!(r("Abort Work"), "ROLLBACK Work");
+        assert_eq!(r("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
+    }
+
+    #[test]
+    fn leaves_non_abort_alone() {
+        assert_eq!(r("SELECT 1"), "SELECT 1");
+        assert_eq!(r("BEGIN"), "BEGIN");
+        assert_eq!(r("ROLLBACK"), "ROLLBACK");
+        assert_eq!(r("SELECT aborted FROM t"), "SELECT aborted FROM t");
+        assert_eq!(r("ABORTED"), "ABORTED");
+    }
+}
 
 /// Simple startup handler that does no authentication
 pub struct SimpleStartupHandler {
@@ -160,7 +216,8 @@ impl SimpleQueryHandler for DfSessionService {
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
         log::debug!("Received query: {query}");
-
+        let rewritten = rewrite_postgres_synonyms(query);
+        let query = rewritten.as_ref();
         let statements = self
             .parser
             .sql_parser
@@ -188,16 +245,14 @@ impl SimpleQueryHandler for DfSessionService {
             let query = statement.to_string();
             let df = client::execute_statement(client, &self.session_context, &query).await?;
 
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&df).await?;
+            if let Some(resp) = dml_completion(&df).await? {
                 results.push(resp);
             } else {
-                // For non-INSERT queries, return a regular Query response
                 let format_options =
                     Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp =
-                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?;
-                results.push(Response::Query(resp));
+                results.push(Response::Query(
+                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?,
+                ));
             }
         }
         Ok(results)
@@ -206,7 +261,7 @@ impl SimpleQueryHandler for DfSessionService {
 
 #[async_trait]
 impl ExtendedQueryHandler for DfSessionService {
-    type Statement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+    type Statement = ParsedStatement;
     type QueryParser = Parser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
@@ -232,30 +287,40 @@ impl ExtendedQueryHandler for DfSessionService {
     {
         let query = &portal.statement.statement.0;
         log::debug!("Received execute extended query: {query}");
-        // Check query hooks first
-        if !self.query_hooks.is_empty()
-            && let (_, Some((statement, plan))) = &portal.statement.statement
-        {
-            // TODO: in the case where query hooks all return None, we do the param handling again later.
-            let param_types = planner::get_inferred_parameter_types(plan)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            let wire_types = parameter_wire_types(plan)?;
-            let wire_type_refs: Vec<Option<&Type>> = wire_types.iter().map(Some).collect();
-            let inferenced: Vec<Option<DataType>> =
-                planner::ordered_parameter_entries(&param_types)
-                    .into_iter()
-                    .map(|(_, datatype)| datatype)
-                    .collect();
-            let inferenced_refs: Vec<Option<&DataType>> = inferenced
-                .iter()
-                .map(|datatype| datatype.as_ref())
-                .collect();
+        if let (_, Some((_statement, retained))) = &portal.statement.statement {
+            // A deferred plan is rebuilt here rather than pinned per prepared
+            // statement — see `RetainedPlan`. The rebuild goes back through the
+            // parse hooks, so a plan cache serves it without re-optimizing.
+            let rebuilt;
+            let (statement, plan) = match retained.held() {
+                Some(plan) => (_statement.as_ref(), plan),
+                None => {
+                    rebuilt = self
+                        .parser
+                        .rebuild(&portal.statement.statement.0, client)
+                        .await?;
+                    (Some(&rebuilt.0), &rebuilt.1)
+                }
+            };
+            let owned_types;
+            let ordered: Vec<Option<&DataType>> = match retained {
+                RetainedPlan::Held(_) => {
+                    owned_types = planner::get_inferred_parameter_types(plan)
+                        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                    ordered_param_types(&owned_types)
+                }
+                RetainedPlan::Deferred { param_types, .. } => {
+                    param_types.iter().map(|t| t.as_ref()).collect()
+                }
+            };
 
-            let param_values: ParamValues = df::deserialize_parameters_with_server_types(
-                portal,
-                &inferenced_refs,
-                &wire_type_refs,
-            )?;
+            let wire_types = match retained {
+                RetainedPlan::Held(plan) => parameter_wire_types(plan)?,
+                RetainedPlan::Deferred { wire_types, .. } => wire_types.clone(),
+            };
+            let wire_type_refs: Vec<_> = wire_types.iter().map(Some).collect();
+            let mut param_values =
+                df::deserialize_parameters_with_server_types(portal, &ordered, &wire_type_refs)?;
 
             for hook in &self.query_hooks {
                 if let Some(result) = hook
@@ -271,38 +336,46 @@ impl ExtendedQueryHandler for DfSessionService {
                     return result;
                 }
             }
-        }
 
-        if let (_, Some((statement, plan))) = &portal.statement.statement {
-            let param_types = planner::get_inferred_parameter_types(plan)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            let wire_types = parameter_wire_types(plan)?;
-            let wire_type_refs: Vec<Option<&Type>> = wire_types.iter().map(Some).collect();
-            let inferenced: Vec<Option<DataType>> =
-                planner::ordered_parameter_entries(&param_types)
-                    .into_iter()
-                    .map(|(_, datatype)| datatype)
-                    .collect();
-            let inferenced_refs: Vec<Option<&DataType>> = inferenced
+            // Let hooks append fresh values for placeholders they injected at
+            // parse time beyond the client's binds (TimeFusion: a fresh now()
+            // per execute for shape-cached now()+$N queries). Appended in $N
+            // order after the client's params; matched by placeholder id, so
+            // surplus is harmless.
+            let extra: Vec<_> = self
+                .query_hooks
                 .iter()
-                .map(|datatype| datatype.as_ref())
+                .flat_map(|h| h.extra_execute_params(statement))
                 .collect();
-
-            let param_values = df::deserialize_parameters_with_server_types(
-                portal,
-                &inferenced_refs,
-                &wire_type_refs,
-            )?;
+            if !extra.is_empty()
+                && let ParamValues::List(list) = &mut param_values
+            {
+                list.extend(extra.into_iter().map(Into::into));
+            }
 
             let plan = plan
                 .clone()
                 .replace_params_with_values(&param_values)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            let optimised = self
-                .session_context
-                .state()
-                .optimize(&plan)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            // Skip per-query `state.optimize()` ONLY when some hook
+            // pre-optimized the plan at parse time (TimeFusion's PlanCacheHook
+            // does this). Plans that fell through the bypass paths
+            // (statement_to_plan in `do_parse_query`) are still optimized
+            // here. Measured: skipping the redundant optimize on the cached
+            // path dropped pgwire end-to-end p95 from 131ms → 8ms (~16×).
+            let canonical_sql = &portal.statement.statement.0;
+            let pre_optimized = self
+                .query_hooks
+                .iter()
+                .any(|h| h.was_pre_optimized(canonical_sql));
+            let optimised = if pre_optimized {
+                plan
+            } else {
+                self.session_context
+                    .state()
+                    .optimize(&plan)
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            };
 
             let dataframe = {
                 let timeout = client::get_statement_timeout(client);
@@ -328,21 +401,19 @@ impl ExtendedQueryHandler for DfSessionService {
                 }
             };
 
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&dataframe).await?;
-
+            if let Some(resp) = dml_completion(&dataframe).await? {
                 Ok(resp)
             } else {
-                // For non-INSERT queries, return a regular Query response
                 let format_options =
                     Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp = df::encode_dataframe(
-                    dataframe,
-                    &portal.result_column_format,
-                    Some(format_options),
-                )
-                .await?;
-                Ok(Response::Query(resp))
+                Ok(Response::Query(
+                    df::encode_dataframe(
+                        dataframe,
+                        &portal.result_column_format,
+                        Some(format_options),
+                    )
+                    .await?,
+                ))
             }
         } else {
             Ok(Response::EmptyQuery)
@@ -374,15 +445,240 @@ pub(crate) async fn map_rows_affected_for_insert(df: &DataFrame) -> PgWireResult
     Ok(Response::Execution(tag))
 }
 
+/// If `df` runs a DML/COPY plan, execute it and return a `CommandComplete`
+/// response with the right tag; otherwise return `None` so the caller falls
+/// back to the regular `Response::Query` path. Driving this off
+/// `LogicalPlan` (not the parsed AST) keeps the simple- and extended-query
+/// paths consistent with what DataFusion actually runs — statement-level
+/// rewrites can leave the AST in a non-Insert variant for what's really a write.
+async fn dml_completion(df: &DataFrame) -> PgWireResult<Option<Response>> {
+    use datafusion::arrow::array::UInt64Array;
+    use datafusion::logical_expr::dml::WriteOp;
+    let tag = match df.logical_plan() {
+        LogicalPlan::Dml(d) => match d.op {
+            WriteOp::Insert(_) => Tag::new("INSERT").with_oid(0),
+            WriteOp::Update => Tag::new("UPDATE"),
+            WriteOp::Delete => Tag::new("DELETE"),
+            WriteOp::Ctas => Tag::new("SELECT"),
+            WriteOp::Truncate => Tag::new("TRUNCATE"),
+            _ => {
+                return Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "0A000".to_string(),
+                        format!("unsupported write operation: {:?}", d.op),
+                    ),
+                )));
+            }
+        },
+        LogicalPlan::Copy(_) => Tag::new("COPY"),
+        _ => return Ok(None),
+    };
+    let batches = df
+        .clone()
+        .collect()
+        .await
+        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+    let rows = batches
+        .first()
+        .and_then(|b| b.column_by_name("count"))
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .map_or(0, |a| a.value(0) as usize);
+    Ok(Some(Response::Execution(tag.with_rows(rows))))
+}
+
+/// A prepared statement as the portal store holds it, for the life of the
+/// statement: canonical SQL, plus the planned form when the text parsed to one.
+///
+/// EVERYTHING IN HERE IS PINNED UNTIL THE CLIENT CLOSES THE STATEMENT, and
+/// `MemPortalStore` is an unbounded `BTreeMap` per connection. A client that
+/// varies its statement text — a bulk `INSERT ... VALUES` whose tuple count
+/// follows the batch size is the classic case — mints a new entry per shape and
+/// never closes any of them, so anything proportional to the payload is
+/// retained N_connections x M_shapes times.
+///
+/// Both halves have now been cut on that basis:
+/// - the AST, 2026-08-07: 35-42% of live heap, growing ~1 GB/min. See
+///   [`is_bulk_data`].
+/// - the `LogicalPlan`, 2026-08-14: the AST fix left this half, and it became
+///   the top consumer in its turn — `LogicalPlan`/`Expr`/`Cast` clones growing
+///   linearly to 48% of live heap, OOM-killing the process at the 96 GiB memcg
+///   limit every 30-60 minutes. See [`RetainedPlan`].
+pub type ParsedStatement = (
+    String,
+    Option<(Option<sqlparser::ast::Statement>, RetainedPlan)>,
+);
+
+/// The planned form a prepared statement holds.
+///
+/// A `LogicalPlan` for a bulk data statement is proportional to the payload,
+/// and Describe needs only two small facts derived from it: the parameter types
+/// and the result schema. So for those statements we keep the facts and drop
+/// the plan, rebuilding it at Execute — where the SQL text is unchanged, so a
+/// plan cache in front of the parse hook (TimeFusion has one) serves every
+/// connection from ONE copy. That turns N_connections x M_shapes retained plans
+/// into M.
+#[derive(Clone, Debug)]
+pub enum RetainedPlan {
+    /// Held verbatim. Everything that is not a bulk data statement — dashboard
+    /// SELECTs and control statements are small, and re-planning them per
+    /// execute would be a pointless cost.
+    Held(LogicalPlan),
+    /// A bulk data statement: only what Describe answers from.
+    Deferred {
+        /// Ordered `$1..$N`, exactly as `ordered_param_types` would yield.
+        param_types: Vec<Option<DataType>>,
+        /// `None` = NoData (a DML/COPY count schema); see [`result_schema`].
+        schema: Option<datafusion::arrow::datatypes::SchemaRef>,
+        /// PostgreSQL wire types advertised at Parse, including semantic overrides.
+        wire_types: Vec<Type>,
+    },
+}
+
+impl RetainedPlan {
+    /// The plan, when it is still here. `None` means it must be rebuilt.
+    fn held(&self) -> Option<&LogicalPlan> {
+        match self {
+            Self::Held(plan) => Some(plan),
+            Self::Deferred { .. } => None,
+        }
+    }
+}
+
+/// The arrow schema a plan's results describe, or `None` for NoData.
+///
+/// DataFusion emits `[count: UInt64]` for every DML/COPY plan — see
+/// `make_count_schema` in datafusion/expr/src/logical_plan/dml.rs. pgwire's
+/// contract for these without RETURNING is NoData; strict clients reject a
+/// TuplesOk/NoData mismatch at Describe time. Match on the exact shape so
+/// RETURNING (wider schema) and any future upstream rename (e.g.
+/// `rows_affected`) fall through to the real result path — at which point this
+/// guard needs to be updated. (More precise than upstream #329's blanket
+/// Dml/Ddl→NoData, which would drop RETURNING columns.)
+fn result_schema(plan: &LogicalPlan) -> Option<datafusion::arrow::datatypes::SchemaRef> {
+    let schema = plan.schema();
+    let fields = schema.fields();
+    if matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Copy(_))
+        && fields.len() == 1
+        && fields[0].name() == "count"
+        && fields[0].data_type() == &DataType::UInt64
+    {
+        return None;
+    }
+    Some(Arc::new(schema.as_arrow().clone()))
+}
+
+/// Wrap a freshly built plan for retention, dropping the body of a bulk data
+/// statement's plan and keeping only what Describe answers from.
+fn retain_plan(
+    statement: &sqlparser::ast::Statement,
+    plan: LogicalPlan,
+) -> PgWireResult<RetainedPlan> {
+    if !is_bulk_data(statement) {
+        return Ok(RetainedPlan::Held(plan));
+    }
+    let params = planner::get_inferred_parameter_types(&plan)
+        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+    Ok(RetainedPlan::Deferred {
+        param_types: ordered_param_types(&params)
+            .into_iter()
+            .map(|t| t.cloned())
+            .collect(),
+        schema: result_schema(&plan),
+        wire_types: parameter_wire_types(&plan)?,
+    })
+}
+
+/// Whether a statement's AST and plan are proportional to its payload, and so
+/// must not be pinned for the life of the prepared statement.
+///
+/// Execute rebuilds these ASTs for hooks, including permission checks.
+/// Non-bulk statements retain their ASTs and plans.
+fn is_bulk_data(statement: &sqlparser::ast::Statement) -> bool {
+    matches!(
+        statement,
+        sqlparser::ast::Statement::Insert(_)
+            | sqlparser::ast::Statement::Update { .. }
+            | sqlparser::ast::Statement::Delete(_)
+            | sqlparser::ast::Statement::Copy { .. }
+    )
+}
+
+fn retained_ast(statement: sqlparser::ast::Statement) -> Option<sqlparser::ast::Statement> {
+    (!is_bulk_data(&statement)).then_some(statement)
+}
+
 pub struct Parser {
     session_context: Arc<SessionContext>,
     sql_parser: PostgresCompatibilityParser,
     query_hooks: Vec<Arc<dyn QueryHook>>,
 }
 
+impl Parser {
+    /// Plan one already-parsed statement, giving the hooks first refusal.
+    ///
+    /// Shared by Parse and by the Execute-time rebuild of a deferred plan, so
+    /// the two cannot drift: whatever a hook returns at Parse (TimeFusion's
+    /// plan cache pre-optimizes here) is what Execute gets back.
+    async fn plan_statement<C>(
+        &self,
+        statement: &sqlparser::ast::Statement,
+        client: &C,
+    ) -> PgWireResult<LogicalPlan>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let context = &self.session_context;
+        for hook in &self.query_hooks {
+            if let Some(logical_plan) = hook
+                .handle_extended_parse_query(statement, context, client)
+                .await
+            {
+                return logical_plan;
+            }
+        }
+        context
+            .state()
+            .statement_to_plan(Statement::Statement(Box::new(statement.clone())))
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))
+    }
+
+    /// Rebuild the plan for a statement whose plan was not retained.
+    ///
+    /// Re-parses the stored canonical SQL and re-plans it. The text is
+    /// byte-identical to what Parse saw, so a plan cache in front of the parse
+    /// hook serves this from one shared copy across every connection — which is
+    /// the entire point of deferring (see [`RetainedPlan`]).
+    async fn rebuild<C>(
+        &self,
+        sql: &str,
+        client: &C,
+    ) -> PgWireResult<(sqlparser::ast::Statement, LogicalPlan)>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let rewritten = rewrite_postgres_synonyms(sql);
+        let mut statements = self
+            .sql_parser
+            .parse(rewritten.as_ref())
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        if statements.is_empty() {
+            return Err(PgWireError::ApiError(Box::new(
+                datafusion::error::DataFusionError::Plan(format!(
+                    "prepared statement no longer parses: {sql}"
+                )),
+            )));
+        }
+        let statement = statements.remove(0);
+        let plan = self.plan_statement(&statement, client).await?;
+        Ok((statement, plan))
+    }
+}
+
 #[async_trait]
 impl QueryParser for Parser {
-    type Statement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+    type Statement = ParsedStatement;
 
     async fn parse_sql<C>(
         &self,
@@ -394,6 +690,8 @@ impl QueryParser for Parser {
         C: ClientInfo + Unpin + Send + Sync,
     {
         log::debug!("Received parse extended query: {sql}");
+        let rewritten = rewrite_postgres_synonyms(sql);
+        let sql = rewritten.as_ref();
         let mut statements = self
             .sql_parser
             .parse(sql)
@@ -404,29 +702,30 @@ impl QueryParser for Parser {
 
         let statement = statements.remove(0);
         let query = statement.to_string();
-
-        let context = &self.session_context;
-        let state = context.state();
-
-        for hook in &self.query_hooks {
-            if let Some(logical_plan) = hook
-                .handle_extended_parse_query(&statement, context, client)
-                .await
-            {
-                return Ok(Some((query, Some((statement, logical_plan?)))));
-            }
-        }
-
-        let logical_plan = state
-            .statement_to_plan(Statement::Statement(Box::new(statement.clone())))
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-        Ok(Some((query, Some((statement, logical_plan)))))
+        let plan = self.plan_statement(&statement, client).await?;
+        let retained = retain_plan(&statement, plan)?;
+        Ok(Some((query, Some((retained_ast(statement), retained)))))
     }
 
     fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
-        if let (_, Some((_, plan))) = stmt {
-            parameter_wire_types(plan)
+        if let (_, Some((statement, retained))) = stmt {
+            let mut param_types = match retained {
+                RetainedPlan::Held(plan) => parameter_wire_types(plan)?,
+                RetainedPlan::Deferred { wire_types, .. } => wire_types.clone(),
+            };
+
+            // Hide hook-injected trailing placeholders (e.g. now() the plan cache
+            // parameterized above the client's binds) so the client's
+            // ParameterDescription still reports only its own params. They are
+            // the highest-numbered ($N) placeholders, so they sort last.
+            let injected: usize = self
+                .query_hooks
+                .iter()
+                .map(|h| h.injected_param_count(statement.as_ref()))
+                .sum();
+            param_types.truncate(param_types.len().saturating_sub(injected));
+
+            Ok(param_types)
         } else {
             Ok(vec![])
         }
@@ -437,22 +736,22 @@ impl QueryParser for Parser {
         stmt: &Self::Statement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        if let (_, Some((_, plan))) = stmt {
-            if !matches!(plan, LogicalPlan::Ddl(_) | LogicalPlan::Dml(_)) {
-                let schema = plan.schema();
-                let fields = arrow_schema_to_pg_fields(
-                    schema.as_arrow(),
-                    column_format.unwrap_or(&Format::UnifiedText),
-                    None,
-                )?;
-
-                Ok(fields)
-            } else {
-                Ok(vec![])
-            }
-        } else {
-            Ok(vec![])
-        }
+        let Some((_, retained)) = stmt.1.as_ref() else {
+            return Ok(vec![]);
+        };
+        let schema = match retained {
+            RetainedPlan::Held(plan) => result_schema(plan),
+            RetainedPlan::Deferred { schema, .. } => schema.clone(),
+        };
+        // `None` is NoData — see `result_schema`.
+        let Some(schema) = schema else {
+            return Ok(vec![]);
+        };
+        arrow_schema_to_pg_fields(
+            &schema,
+            column_format.unwrap_or(&Format::UnifiedBinary),
+            None,
+        )
     }
 }
 
@@ -480,6 +779,20 @@ fn parameter_wire_types(plan: &LogicalPlan) -> PgWireResult<Vec<Type>> {
         }
     }
     Ok(types)
+}
+
+fn ordered_param_types(types: &HashMap<String, Option<DataType>>) -> Vec<Option<&DataType>> {
+    // Datafusion stores the parameters as a map.  In our case, the keys will be
+    // `$1`, `$2` etc.  The values will be the parameter types.
+    //
+    // PATCH (timefusion): original implementation sorted lexicographically
+    // (`a.0.cmp(b.0)`), which puts `$10` before `$2` and breaks every
+    // INSERT/SELECT with more than 9 placeholders — the ParameterDescription
+    // returned to the client has the wrong positional order, so e.g. a uuid
+    // gets typed as TIMESTAMPTZ. Sort by the numeric suffix instead.
+    let mut entries: Vec<_> = types.iter().collect();
+    entries.sort_by_key(|(k, _)| k.trim_start_matches('$').parse::<u32>().unwrap_or(u32::MAX));
+    entries.into_iter().map(|pt| pt.1.as_ref()).collect()
 }
 
 #[cfg(test)]
@@ -519,13 +832,43 @@ mod tests {
 
         async fn handle_extended_query(
             &self,
-            _statement: &sqlparser::ast::Statement,
+            _statement: Option<&sqlparser::ast::Statement>,
             _logical_plan: &LogicalPlan,
             _params: &ParamValues,
             _session_context: &SessionContext,
             _client: &mut dyn HookClient,
         ) -> Option<PgWireResult<Response>> {
             None
+        }
+    }
+
+    /// A prepared statement pins whatever `parse_sql` returns. Bulk data
+    /// statements must not pin their AST (2026-08-07: 35-42% of TimeFusion's
+    /// live heap), and everything the execute-time hooks dispatch on must.
+    #[test]
+    fn bulk_data_statements_do_not_pin_their_ast() {
+        let parse = |sql: &str| {
+            PostgresCompatibilityParser::new()
+                .parse(sql)
+                .unwrap()
+                .remove(0)
+        };
+        for sql in [
+            "INSERT INTO t VALUES (1), (2)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+        ] {
+            assert!(retained_ast(parse(sql)).is_none(), "must not pin: {sql}");
+        }
+        for sql in [
+            "SET x = 1",
+            "SHOW ALL",
+            "BEGIN",
+            "COMMIT",
+            "DECLARE c CURSOR FOR SELECT 1",
+            "SELECT 1",
+        ] {
+            assert!(retained_ast(parse(sql)).is_some(), "must pin: {sql}");
         }
     }
 

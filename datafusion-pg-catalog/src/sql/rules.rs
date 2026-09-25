@@ -672,6 +672,8 @@ pub struct CurrentUserVariableToSessionUserFunctionCall;
 /// `Function` nodes produced by sqlparser that need renaming.
 const BUILTIN_FUNCTION_RENAME: &[(&str, &str)] = &[
     ("current_user", "session_user"),
+    ("session_user", "session_user"),
+    ("user", "session_user"),
     ("current_catalog", "current_database"),
 ];
 
@@ -1442,6 +1444,9 @@ mod tests {
         // postgres dialect (re-parsed by DataFusion downstream).
         assert_rewrite!(&rules, "SELECT current_user", "SELECT session_user");
         assert_rewrite!(&rules, "SELECT CURRENT_USER", "SELECT session_user");
+        assert_rewrite!(&rules, "SELECT SESSION_USER", "SELECT session_user");
+        assert_rewrite!(&rules, "SELECT USER", "SELECT session_user");
+        assert_rewrite!(&rules, "SELECT \"user\"", "SELECT \"user\"");
         assert_rewrite!(
             &rules,
             "SELECT is_null(current_user)",

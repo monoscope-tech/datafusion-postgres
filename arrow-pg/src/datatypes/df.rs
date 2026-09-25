@@ -761,14 +761,41 @@ where
 
                 deserialized_params.push(scalar_value);
             }
-            Type::UUID => {
-                let value = portal.parameter::<String>(i, &pg_type)?;
-                // Store UUID as string for now
-                deserialized_params.push(ScalarValue::Utf8(value));
-            }
-            Type::JSON | Type::JSONB => {
-                let value = portal.parameter::<String>(i, &pg_type)?;
-                // Store JSON as string for now
+            Type::UUID | Type::JSON | Type::JSONB => {
+                // String's FromSql rejects these OIDs. Preserve the UTF-8
+                // representation without parsing and re-serializing JSON.
+                let raw = portal
+                    .parameters
+                    .get(i)
+                    .ok_or(PgWireError::ParameterIndexOutOfBound(i))?;
+                let value = raw
+                    .as_deref()
+                    .map(|raw| {
+                        if pg_type == Type::UUID && portal.parameter_format.is_binary(i) {
+                            return uuid::Uuid::from_slice(raw)
+                                .map(|value| value.to_string())
+                                .map_err(|error| {
+                                    PgWireError::FailedToParseParameter(Box::new(error))
+                                });
+                        }
+                        let body = if pg_type == Type::JSONB && portal.parameter_format.is_binary(i)
+                        {
+                            match raw.split_first() {
+                                Some((1, body)) => body,
+                                _ => {
+                                    return Err(PgWireError::FailedToParseParameter(
+                                        "binary JSONB requires version 1".into(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            raw
+                        };
+                        std::str::from_utf8(body)
+                            .map(str::to_owned)
+                            .map_err(|error| PgWireError::FailedToParseParameter(Box::new(error)))
+                    })
+                    .transpose()?;
                 deserialized_params.push(ScalarValue::Utf8(value));
             }
             Type::INTERVAL => {
@@ -1156,7 +1183,10 @@ mod tests {
     use pg_interval::Interval;
     use pgwire::{
         api::{portal::Portal, stmt::StoredStatement},
-        messages::{data::FORMAT_CODE_BINARY, extendedquery::Bind},
+        messages::{
+            data::{FORMAT_CODE_BINARY, FORMAT_CODE_TEXT},
+            extendedquery::Bind,
+        },
     };
     use postgres_types::{ToSql, Type};
     use rust_decimal::Decimal;
@@ -1745,11 +1775,89 @@ mod tests {
         );
     }
 
-    // -- UUID, JSON --
-    // These types don't have FromSql<String> support in pgwire, so they
-    // fall through to the `_` wildcard branch which calls
-    // `portal.parameter::<String>()`. Testing them requires a postgres
-    // round-trip, so we skip unit tests for these.
+    #[test]
+    fn uuid_and_json_bind_payloads() {
+        for (pg_type, format, payload, expected) in [
+            (
+                Type::UUID,
+                FORMAT_CODE_BINARY,
+                &[0_u8; 16][..],
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            (
+                Type::UUID,
+                FORMAT_CODE_TEXT,
+                b"00112233-4455-6677-8899-aabbccddeeff".as_slice(),
+                "00112233-4455-6677-8899-aabbccddeeff",
+            ),
+            (
+                Type::JSON,
+                FORMAT_CODE_BINARY,
+                b"{\"x\": 1}".as_slice(),
+                "{\"x\": 1}",
+            ),
+            (
+                Type::JSON,
+                FORMAT_CODE_TEXT,
+                b"[null, 2]".as_slice(),
+                "[null, 2]",
+            ),
+            (
+                Type::JSONB,
+                FORMAT_CODE_BINARY,
+                b"\x01{\"x\": 1}".as_slice(),
+                "{\"x\": 1}",
+            ),
+            (
+                Type::JSONB,
+                FORMAT_CODE_TEXT,
+                b"[null, 2]".as_slice(),
+                "[null, 2]",
+            ),
+        ] {
+            for (raw, expected) in [
+                (Some(Bytes::copy_from_slice(payload)), Some(expected)),
+                (None, None),
+            ] {
+                let bind = Bind::new(None, None, vec![format], vec![raw], vec![]);
+                let statement = StoredStatement::new("id".into(), "s", vec![Some(pg_type.clone())]);
+                let portal = Portal::try_new(&bind, Arc::new(statement)).unwrap();
+                assert_eq!(
+                    get_result(&portal, Some(&DataType::Utf8)),
+                    ScalarValue::Utf8(expected.map(str::to_owned)),
+                    "{pg_type}: format {format}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_binary_uuid_and_json_bind_payloads_are_rejected() {
+        for (pg_type, payload) in [
+            (Type::UUID, b"short".as_slice()),
+            (Type::JSONB, b"".as_slice()),
+            (Type::JSONB, b"\x02{}".as_slice()),
+            (Type::JSONB, b"\x01\xff".as_slice()),
+            (Type::JSON, b"\xff".as_slice()),
+        ] {
+            let bind = Bind::new(
+                None,
+                None,
+                vec![FORMAT_CODE_BINARY],
+                vec![Some(Bytes::copy_from_slice(payload))],
+                vec![],
+            );
+            let statement = StoredStatement::new("id".into(), "s", vec![Some(pg_type.clone())]);
+            let portal = Portal::try_new(&bind, Arc::new(statement)).unwrap();
+            assert!(
+                matches!(
+                    deserialize_parameters(&portal, &[Some(&DataType::Utf8)]),
+                    Err(pgwire::error::PgWireError::FailedToParseParameter(_))
+                ),
+                "{pg_type}: {payload:?}"
+            );
+        }
+    }
 
     // -- Advanced types (MONEY, INET, MACADDR) --
     // Same as above: pgwire's FromSql<String> doesn't accept MONEY/INET/MACADDR.

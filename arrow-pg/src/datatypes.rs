@@ -251,6 +251,12 @@ pub fn field_into_pg_type(field: &Arc<Field>) -> PgWireResult<Type> {
         return Ok(pg_vector_type());
     }
 
+    match field.metadata().get("tf.pg_type").map(String::as_str) {
+        Some("json") => return Ok(Type::JSON),
+        Some("jsonb") => return Ok(Type::JSONB),
+        _ => {}
+    }
+
     let arrow_type = field.data_type();
 
     match field.extension_type_name() {

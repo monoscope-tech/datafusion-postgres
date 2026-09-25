@@ -407,6 +407,7 @@ dependencies = [
  "postgres-types",
  "rust_decimal",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

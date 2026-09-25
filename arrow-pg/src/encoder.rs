@@ -1,7 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[cfg(feature = "pgvector")]
 use bytes::BytesMut;
 
 #[cfg(not(feature = "datafusion"))]
@@ -16,7 +15,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::CopyData;
 use pgwire::messages::data::DataRow;
 use pgwire::types::ToSqlText;
-use postgres_types::ToSql;
+use postgres_types::{IsNull, ToSql, Type, to_sql_checked};
 use rust_decimal::Decimal;
 use timezone::Tz;
 
@@ -25,6 +24,42 @@ use crate::error::ToSqlError;
 use crate::geo_encoder::encode_geo;
 use crate::list_encoder::encode_list;
 use crate::struct_encoder::encode_struct;
+
+/// Borrows serialized JSON; only binary JSONB adds a version byte.
+#[derive(Debug)]
+struct JsonStr<'a>(&'a str);
+
+impl ToSql for JsonStr<'_> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty == Type::JSONB {
+            out.extend_from_slice(&[1]);
+        }
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB)
+    }
+
+    to_sql_checked!();
+}
+
+impl ToSqlText for JsonStr<'_> {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _options: &pgwire::types::format::FormatOptions,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+}
 
 pub trait Encoder {
     type Item;
@@ -514,8 +549,18 @@ pub fn encode_value<T: Encoder>(
         DataType::Decimal128(_, s) => {
             encoder.encode_field(&get_numeric_128_value(arr, idx, *s as u32)?, pg_field)?
         }
-        DataType::Utf8 => encoder.encode_field(&get_utf8_value(arr, idx), pg_field)?,
-        DataType::Utf8View => encoder.encode_field(&get_utf8_view_value(arr, idx), pg_field)?,
+        DataType::Utf8 | DataType::Utf8View => {
+            let value = if *arrow_type == DataType::Utf8 {
+                get_utf8_value(arr, idx)
+            } else {
+                get_utf8_view_value(arr, idx)
+            };
+            if matches!(*pg_field.datatype(), Type::JSON | Type::JSONB) {
+                encoder.encode_field(&value.map(JsonStr), pg_field)?;
+            } else {
+                encoder.encode_field(&value, pg_field)?;
+            }
+        }
         DataType::BinaryView => encoder.encode_field(&get_binary_view_value(arr, idx), pg_field)?,
         DataType::LargeUtf8 => encoder.encode_field(&get_large_utf8_value(arr, idx), pg_field)?,
         DataType::Binary => encoder.encode_field(&get_binary_value(arr, idx), pg_field)?,
@@ -765,6 +810,60 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
+
+    #[test]
+    fn json_metadata_and_wire_output() {
+        use crate::datatypes::{arrow_schema_to_pg_fields, encode_recordbatch};
+        use pgwire::api::portal::Format;
+
+        let arrays: [ArrayRef; 2] = [
+            Arc::new(StringArray::from(vec![Some("{\"x\":1}"), None])),
+            Arc::new(StringViewArray::from(vec![Some("{\"x\":1}"), None])),
+        ];
+        for array in arrays {
+            for (tag, expected_type, format, expected) in [
+                (
+                    "json",
+                    Type::JSON,
+                    Format::UnifiedText,
+                    b"\x00\x00\x00\x07{\"x\":1}".as_slice(),
+                ),
+                (
+                    "json",
+                    Type::JSON,
+                    Format::UnifiedBinary,
+                    b"\x00\x00\x00\x07{\"x\":1}".as_slice(),
+                ),
+                (
+                    "jsonb",
+                    Type::JSONB,
+                    Format::UnifiedText,
+                    b"\x00\x00\x00\x07{\"x\":1}".as_slice(),
+                ),
+                (
+                    "jsonb",
+                    Type::JSONB,
+                    Format::UnifiedBinary,
+                    b"\x00\x00\x00\x08\x01{\"x\":1}".as_slice(),
+                ),
+            ] {
+                let field = Field::new("payload", array.data_type().clone(), true)
+                    .with_metadata([("tf.pg_type".to_owned(), tag.to_owned())].into());
+                let schema = Arc::new(Schema::new(vec![field]));
+                let fields = Arc::new(arrow_schema_to_pg_fields(&schema, &format, None).unwrap());
+                assert_eq!(fields[0].datatype(), &expected_type);
+                let batch = RecordBatch::try_new(schema, vec![array.clone()]).unwrap();
+                let rows = encode_recordbatch(fields, batch)
+                    .collect::<PgWireResult<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].field_count, 1);
+                assert_eq!(rows[0].data.as_ref(), expected);
+                assert_eq!(rows[1].field_count, 1);
+                assert_eq!(rows[1].data.as_ref(), b"\xff\xff\xff\xff");
+            }
+        }
+    }
 
     #[test]
     fn encodes_dictionary_array() {

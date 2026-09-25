@@ -232,7 +232,7 @@ impl QueryHook for PgVectorInsertHook {
 
     async fn handle_extended_query(
         &self,
-        _statement: &Statement,
+        _statement: Option<&Statement>,
         _logical_plan: &LogicalPlan,
         _params: &datafusion::common::ParamValues,
         _session_context: &SessionContext,

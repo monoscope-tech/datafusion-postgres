@@ -16,7 +16,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use super::{HookClient, QueryHook};
 use crate::arrow_pg::datatypes::df;
 
-pub(crate) type DfStatement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+pub(crate) type DfStatement = crate::handlers::ParsedStatement;
 
 /// Hook for processing cursor-related statements (DECLARE/FETCH/CLOSE)
 #[derive(Debug)]
@@ -65,12 +65,14 @@ impl QueryHook for CursorStatementHook {
 
     async fn handle_extended_query(
         &self,
-        statement: &sqlparser::ast::Statement,
+        statement: Option<&sqlparser::ast::Statement>,
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        // A dropped AST is only ever a bulk data statement, never DECLARE/FETCH.
+        let statement = statement?;
         let store = client.portal_store();
 
         match statement {

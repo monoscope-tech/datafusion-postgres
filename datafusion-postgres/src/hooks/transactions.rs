@@ -79,13 +79,14 @@ impl QueryHook for TransactionStatementHook {
 
     async fn handle_extended_query(
         &self,
-        statement: &Statement,
+        statement: Option<&Statement>,
         _logical_plan: &LogicalPlan,
         _params: &ParamValues,
         session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        self.handle_simple_query(statement, session_context, client)
+        // A dropped AST is only ever a bulk data statement, never BEGIN/COMMIT.
+        self.handle_simple_query(statement?, session_context, client)
             .await
     }
 }

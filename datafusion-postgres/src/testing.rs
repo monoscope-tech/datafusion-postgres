@@ -1,8 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::sql::sqlparser;
 use datafusion_pg_catalog::pg_catalog::setup_pg_catalog;
 use futures::Sink;
 use pgwire::{
@@ -31,7 +29,7 @@ pub fn setup_handlers() -> DfSessionService {
     DfSessionService::new(Arc::new(session_context))
 }
 
-type DfStatement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+type DfStatement = crate::handlers::ParsedStatement;
 
 #[derive(Debug, Default)]
 pub struct MockClient {

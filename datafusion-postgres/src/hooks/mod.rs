@@ -5,7 +5,7 @@ pub mod transactions;
 
 use async_trait::async_trait;
 
-use datafusion::common::ParamValues;
+use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
@@ -64,10 +64,48 @@ pub trait QueryHook: Send + Sync {
         client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>>;
 
-    /// called at extended query execute phase, for query execution
+    /// Whether the plan this hook returned (for `canonical_sql`) was already
+    /// optimized. Lets the do_query path skip a redundant `state.optimize()`
+    /// call. Default `false` is conservative — the caller will optimize the
+    /// plan as if it had been freshly parsed.
+    fn was_pre_optimized(&self, _canonical_sql: &str) -> bool {
+        false
+    }
+
+    /// How many trailing placeholders this hook injected into the plan beyond
+    /// the client's binds (see `extra_execute_params`). The Parse/Describe path
+    /// hides exactly this many from the `ParameterDescription` so the client
+    /// still sees only its own params. MUST equal the number of values
+    /// `extra_execute_params` appends for the same statement.
+    /// `None` when the AST was not retained past Parse — see
+    /// [`crate::handlers::is_bulk_data`]; no such statement carries an
+    /// injected placeholder, so the count is zero.
+    fn injected_param_count(&self, _statement: Option<&Statement>) -> usize {
+        0
+    }
+
+    /// Extra positional parameter values for placeholders this hook injected
+    /// into the plan at parse time BEYOND the client's bound params (e.g. a
+    /// fresh `now()` instant). Appended to the client's deserialized params
+    /// before `replace_params_with_values`, so those placeholders resolve to a
+    /// fresh value on every execute — correct even for reused (named) prepared
+    /// statements, where the parse hook runs only once. Values are matched by
+    /// placeholder id, so any surplus (a statement the hook did not inject into)
+    /// is ignored; returning `[]` is the safe default.
+    /// The parser supplies a transient AST for deferred bulk statements.
+    /// Hooks must also accept `None` for externally constructed statements.
+    fn extra_execute_params(&self, _statement: Option<&Statement>) -> Vec<ScalarValue> {
+        Vec::new()
+    }
+
+    /// called at extended query execute phase, for query execution.
+    ///
+    /// The parser rebuilds a transient AST for deferred bulk statements.
+    /// External callers can omit the AST. Authorization hooks must reject
+    /// `None` when their permission check requires the statement.
     async fn handle_extended_query(
         &self,
-        statement: &Statement,
+        statement: Option<&Statement>,
         logical_plan: &LogicalPlan,
         params: &ParamValues,
         session_context: &SessionContext,
