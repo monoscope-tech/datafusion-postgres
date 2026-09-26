@@ -923,11 +923,8 @@ const REG_CAST_SPECS: &[RegCastSpec] = &[
         type_name: "regtype",
         query: "SELECT oid FROM pg_catalog.pg_type WHERE typname = $1",
     },
-    // regproc: function name -> pg_proc.oid
-    RegCastSpec {
-        type_name: "regproc",
-        query: "SELECT oid FROM pg_catalog.pg_proc WHERE proname = $1",
-    },
+    // regproc is deliberately absent: Timefusion's type planner keeps it as text, and a
+    // name missing from pg_proc made this lookup yield NULL into a non-nullable oid column.
 ];
 
 impl Default for RewriteRegCastToSubquery {
@@ -1635,11 +1632,6 @@ mod tests {
             &rules,
             "SELECT 'pg_class'::regclass",
             "SELECT (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid CROSS JOIN (SELECT parse_ident('pg_class'::TEXT) AS parts) WHERE array_length(parts, 1) IN (1, 2) AND ((array_length(parts, 1) = 1 AND n.nspname = current_schema() AND c.relname = parts[1]) OR (array_length(parts, 1) = 2 AND n.nspname = parts[1] AND c.relname = parts[2])))"
-        );
-        assert_rewrite!(
-            &rules,
-            "SELECT 'array_in'::regproc",
-            "SELECT (SELECT oid FROM pg_catalog.pg_proc WHERE proname = 'array_in')"
         );
         assert_rewrite!(
             &rules,
