@@ -458,9 +458,21 @@ impl SqlStatementRewriteRule for RewriteArrayAnyAllOperation {
 #[derive(Debug)]
 pub struct PrependUnqualifiedPgTableName;
 
+/// Runtime statistics views embedders overlay onto `pg_catalog` (the catalog ships no
+/// provider for them); clients query them unqualified like any catalog relation.
+const PG_CATALOG_RUNTIME_VIEWS: &[&str] = &[
+    "pg_stat_activity",
+    "pg_stat_database",
+    "pg_locks",
+    "pg_prepared_xacts",
+    "pg_stat_replication",
+    "pg_available_extensions",
+];
+
 fn is_pg_catalog_table(name: &str) -> bool {
     PG_CATALOG_TABLES
         .iter()
+        .chain(PG_CATALOG_RUNTIME_VIEWS)
         .any(|table| table.eq_ignore_ascii_case(name))
 }
 
