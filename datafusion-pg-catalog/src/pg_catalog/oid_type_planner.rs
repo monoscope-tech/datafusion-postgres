@@ -214,6 +214,11 @@ impl TypePlanner for PgOidTypePlanner {
         //    recursing into this planner for the element type, so no Array arm
         //    is needed here.
         if let Some(kind) = Self::kind_for(sql_type) {
+            // `regproc` casts stay text: there is no forward name->oid rewrite for it, and a
+            // function name cannot be cast to int4.
+            if kind == super::oid_field::kind::REGPROC {
+                return Ok(Some(Arc::new(Field::new("", DataType::Utf8, true))));
+            }
             return Ok(Some(Self::oid_field(&kind)));
         }
         // 2. pg_catalog-qualified builtins (pg_catalog.text, pg_catalog.int2,
@@ -260,7 +265,6 @@ mod tests {
         let planner = PgOidTypePlanner;
         for t in [
             "regclass",
-            "regproc",
             "regtype",
             "regnamespace",
             "oid",
@@ -280,6 +284,15 @@ mod tests {
     }
 
     #[test]
+    fn regproc_casts_stay_text() {
+        let planner = PgOidTypePlanner;
+        for sql in ["regproc", "pg_catalog.regproc"] {
+            let dt = cast_target_type(&format!("SELECT 'x'::{sql} AS c"));
+            assert_eq!(planner.plan_type_field(&dt).unwrap().unwrap().data_type(), &DataType::Utf8, "{sql}");
+        }
+    }
+
+    #[test]
     fn leaves_non_oid_types_alone() {
         let planner = PgOidTypePlanner;
         for t in ["int4", "text", "varchar", "timestamp"] {
@@ -293,7 +306,7 @@ mod tests {
         let planner = PgOidTypePlanner;
         // Both bare and pg_catalog-qualified names plan to the same
         // (metadata-free) int4 field.
-        for sql in ["regproc", "pg_catalog.regproc"] {
+        for sql in ["regtype", "pg_catalog.regtype"] {
             let dt = cast_target_type(&format!("SELECT 'x'::{sql} AS c"));
             let field = planner.plan_type_field(&dt).unwrap().unwrap();
             assert_eq!(field.data_type(), &DataType::Int32, "{sql}");
