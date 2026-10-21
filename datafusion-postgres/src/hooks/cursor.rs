@@ -359,19 +359,19 @@ async fn handle_fetch(
         }
     };
 
-    if let Some(cursor) = cursor_source(client, cursor_name).await {
-        if matches!(
+    if let Some(cursor) = cursor_source(client, cursor_name).await
+        && matches!(
             &*portal.state().lock().await,
             pgwire::api::portal::PortalExecutionState::Initial
-        ) {
-            let selected = Arc::new(CursorSource {
-                limit: max_rows,
-                ..cursor.as_ref().clone()
-            });
-            return Ok(Response::Query(
-                df::encode_dataframe(selected.dataframe(context)?, format, None).await?,
-            ));
-        }
+        )
+    {
+        let selected = Arc::new(CursorSource {
+            limit: max_rows,
+            ..cursor.as_ref().clone()
+        });
+        return Ok(Response::Query(
+            df::encode_dataframe(selected.dataframe(context)?, format, None).await?,
+        ));
     }
     let fetch_result = portal.fetch(max_rows.unwrap_or(0)).await?;
 
