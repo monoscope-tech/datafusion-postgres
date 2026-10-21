@@ -324,12 +324,13 @@ impl ExtendedQueryHandler for DfSessionService {
 
             for hook in &self.query_hooks {
                 if let Some(result) = hook
-                    .handle_extended_query(
+                    .handle_extended_query_formatted(
                         statement,
                         plan,
                         &param_values,
                         &self.session_context,
                         client,
+                        &portal.result_column_format,
                     )
                     .await
                 {
@@ -1014,18 +1015,19 @@ mod tests {
         }
     }
 
-    async fn assert_query_response_empty(response: &mut Response) {
-        use futures::StreamExt;
+    async fn assert_query_response_row_count(response: &mut Response, expected: usize) {
+        use futures::TryStreamExt;
 
         let Response::Query(qr) = response else {
             panic!("Expected Query response, got: {response:?}");
         };
 
-        let mut count = 0;
-        while qr.data_rows().next().await.is_some() {
-            count += 1;
-        }
-        assert_eq!(count, 0, "Expected no rows from exhausted cursor");
+        let count = qr
+            .data_rows()
+            .try_fold(0usize, |count, _| futures::future::ready(Ok(count + 1)))
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "Unexpected number of cursor rows");
     }
 
     #[tokio::test]
@@ -1044,7 +1046,7 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_execution_tag(&responses[0], "DECLARE CURSOR");
 
-        let responses = <DfSessionService as SimpleQueryHandler>::do_query(
+        let mut responses = <DfSessionService as SimpleQueryHandler>::do_query(
             &service,
             &mut client,
             "FETCH NEXT FROM test_cursor",
@@ -1053,10 +1055,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(responses.len(), 1);
-        assert!(
-            matches!(&responses[0], Response::Query(_)),
-            "Expected Query response for FETCH"
-        );
+        assert_query_response_row_count(&mut responses[0], 1).await;
 
         let mut responses = <DfSessionService as SimpleQueryHandler>::do_query(
             &service,
@@ -1067,7 +1066,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(responses.len(), 1);
-        assert_query_response_empty(&mut responses[0]).await;
+        assert_query_response_row_count(&mut responses[0], 0).await;
 
         let responses = <DfSessionService as SimpleQueryHandler>::do_query(
             &service,
@@ -1154,7 +1153,7 @@ mod tests {
         .await
         .unwrap();
 
-        let responses = <DfSessionService as SimpleQueryHandler>::do_query(
+        let mut responses = <DfSessionService as SimpleQueryHandler>::do_query(
             &service,
             &mut client,
             "FETCH FORWARD 3 FROM mycur",
@@ -1162,12 +1161,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            matches!(&responses[0], Response::Query(_)),
-            "Expected Query response for FORWARD 3"
-        );
+        assert_query_response_row_count(&mut responses[0], 3).await;
 
-        let responses = <DfSessionService as SimpleQueryHandler>::do_query(
+        let mut responses = <DfSessionService as SimpleQueryHandler>::do_query(
             &service,
             &mut client,
             "FETCH FORWARD ALL FROM mycur",
@@ -1175,18 +1171,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resp_desc = match &responses[0] {
-            Response::Query(_) => "Query".to_string(),
-            Response::Execution(tag) => {
-                let cc = pgwire::messages::response::CommandComplete::from(tag.clone());
-                format!("Execution({})", cc.tag)
-            }
-            other => format!("{:?}", other),
-        };
-        assert!(
-            matches!(&responses[0], Response::Query(_)),
-            "Expected Query response for remaining rows, got: {resp_desc}"
-        );
+        assert_query_response_row_count(&mut responses[0], 2).await;
 
         let mut responses = <DfSessionService as SimpleQueryHandler>::do_query(
             &service,
@@ -1196,7 +1181,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_query_response_empty(&mut responses[0]).await;
+        assert_query_response_row_count(&mut responses[0], 0).await;
     }
 
     #[tokio::test]

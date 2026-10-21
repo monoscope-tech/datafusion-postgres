@@ -288,7 +288,11 @@ mod tests {
         let planner = PgOidTypePlanner;
         for sql in ["regproc", "pg_catalog.regproc"] {
             let dt = cast_target_type(&format!("SELECT 'x'::{sql} AS c"));
-            assert_eq!(planner.plan_type_field(&dt).unwrap().unwrap().data_type(), &DataType::Utf8, "{sql}");
+            assert_eq!(
+                planner.plan_type_field(&dt).unwrap().unwrap().data_type(),
+                &DataType::Utf8,
+                "{sql}"
+            );
         }
     }
 
