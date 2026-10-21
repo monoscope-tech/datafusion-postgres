@@ -324,12 +324,13 @@ impl ExtendedQueryHandler for DfSessionService {
 
             for hook in &self.query_hooks {
                 if let Some(result) = hook
-                    .handle_extended_query(
+                    .handle_extended_query_formatted(
                         statement,
                         plan,
                         &param_values,
                         &self.session_context,
                         client,
+                        &portal.result_column_format,
                     )
                     .await
                 {

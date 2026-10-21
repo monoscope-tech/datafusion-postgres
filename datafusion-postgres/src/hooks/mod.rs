@@ -98,6 +98,20 @@ pub trait QueryHook: Send + Sync {
         Vec::new()
     }
 
+    /// Execute with the output formats requested by Bind.
+    async fn handle_extended_query_formatted(
+        &self,
+        statement: Option<&Statement>,
+        logical_plan: &LogicalPlan,
+        params: &ParamValues,
+        session_context: &SessionContext,
+        client: &mut dyn HookClient,
+        _format: &pgwire::api::portal::Format,
+    ) -> Option<PgWireResult<Response>> {
+        self.handle_extended_query(statement, logical_plan, params, session_context, client)
+            .await
+    }
+
     /// called at extended query execute phase, for query execution.
     ///
     /// The parser rebuilds a transient AST for deferred bulk statements.
