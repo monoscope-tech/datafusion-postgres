@@ -112,13 +112,15 @@ def test_failed_transaction_handling(conn):
         except Exception:
             print("  ✓ Invalid query failed as expected")
         
-        # Try to execute another query in failed transaction
-        try:
-            cur.execute('SELECT 1')
-            assert False, "Should be blocked in failed transaction"
-        except Exception as e:
-            assert "25P01" in str(e) or "aborted" in str(e).lower()
-            print("  ✓ Subsequent query blocked (error code 25P01)")
+        # Both transaction-hook rejection paths must use PostgreSQL's SQLSTATE.
+        for sql in ('SELECT 1', 'BEGIN'):
+            try:
+                cur.execute(sql)
+            except psycopg.Error as error:
+                assert error.sqlstate == '25P02', (sql, error.sqlstate)
+            else:
+                raise AssertionError(f"{sql} should be blocked in failed transaction")
+        print("  ✓ Queries and BEGIN blocked (error code 25P02)")
         
         # ROLLBACK should work
         cur.execute('ROLLBACK')

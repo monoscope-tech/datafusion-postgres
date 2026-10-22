@@ -43,7 +43,7 @@ impl QueryHook for TransactionStatementHook {
             return Some(Err(PgWireError::UserError(Box::new(
                 pgwire::error::ErrorInfo::new(
                     "ERROR".to_string(),
-                    "25P01".to_string(),
+                    "25P02".to_string(),
                     "current transaction is aborted, commands ignored until end of transaction block".to_string(),
                 ),
             ))));
@@ -113,7 +113,7 @@ where
                     Err(PgWireError::UserError(Box::new(
                             pgwire::error::ErrorInfo::new(
                                 "ERROR".to_string(),
-                                "25P01".to_string(),
+                                "25P02".to_string(),
                                 "current transaction is aborted, commands ignored until end of transaction block".to_string(),
                             ),
                         )))
