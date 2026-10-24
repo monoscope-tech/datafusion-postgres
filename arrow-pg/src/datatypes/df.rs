@@ -99,6 +99,9 @@ fn coerce_int_value(value: Option<i64>, target: &DataType) -> PgWireResult<Scala
         )),
         DataType::Float32 => Ok(ScalarValue::Float32(value.map(|n| n as f32))),
         DataType::Float64 => Ok(ScalarValue::Float64(value.map(|n| n as f64))),
+        DataType::Decimal128(_, _) => ScalarValue::Int64(value)
+            .cast_to(target)
+            .map_err(|error| invalid_parameter_error(error.to_string())),
         DataType::Timestamp(TimeUnit::Second, _) => Ok(ScalarValue::TimestampSecond(value, None)),
         DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(ScalarValue::TimestampMillisecond(
             value.map(|n| n * 1000),
@@ -1278,6 +1281,49 @@ mod tests {
     }
 
     // -- INT2 coercion --
+
+    #[test]
+    fn test_integer_decimal128_parameters() {
+        for (portal, value) in [
+            (make_portal(&12i16, Type::INT2), 12i128),
+            (make_portal(&-12i32, Type::INT4), -12i128),
+            (
+                make_portal(&1_792_854_698i64, Type::INT8),
+                1_792_854_698i128,
+            ),
+            (make_portal(&i64::MAX, Type::INT8), i128::from(i64::MAX)),
+        ] {
+            for (precision, scale) in [(28, 9), (38, 0)] {
+                assert_eq!(
+                    get_result(&portal, Some(&DataType::Decimal128(precision, scale))),
+                    ScalarValue::Decimal128(
+                        Some(value * 10i128.pow(scale as u32)),
+                        precision,
+                        scale
+                    )
+                );
+            }
+        }
+        for wire_type in [Type::INT2, Type::INT4, Type::INT8] {
+            assert_eq!(
+                get_result(
+                    &make_null_portal(wire_type),
+                    Some(&DataType::Decimal128(28, 9))
+                ),
+                ScalarValue::Decimal128(None, 28, 9)
+            );
+        }
+        for (value, precision, scale) in [(100i64, 3, 2), (-100, 3, 2), (i64::MAX, 38, 38)] {
+            assert!(
+                deserialize_parameters(
+                    &make_portal(&value, Type::INT8),
+                    &[Some(&DataType::Decimal128(precision, scale))]
+                )
+                .is_err(),
+                "overflow must fail, not produce NULL"
+            );
+        }
+    }
 
     #[test]
     fn test_int2_direct() {
